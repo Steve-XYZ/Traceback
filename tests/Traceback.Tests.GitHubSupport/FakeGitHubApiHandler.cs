@@ -129,7 +129,7 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
             var items = since is null
                 ? commits.OrderByDescending(c => c.CommitterDate).ToList()
                 : commits.Where(c => c.CommitterDate >= since.Value).OrderByDescending(c => c.CommitterDate).ToList();
-            return ArrayPage(path, items, page, perPage, CommitJson);
+            return ArrayPage(fullPathAndQuery, items, page, perPage, CommitJson);
         }
 
         // GET /repos/{o}/{r}/actions/runs?created=>=...
@@ -163,7 +163,7 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
             var attempts = WorldFor(segments)!.RunAttempts.TryGetValue(runId, out var list)
                 ? list.OrderBy(a => a.RunAttempt).ToList()
                 : [];
-            return ArrayPage(path, attempts, page, perPage, RunJson);
+            return ArrayPage(fullPathAndQuery, attempts, page, perPage, RunJson);
         }
 
         // GET /repos/{o}/{r}/actions/runs/{id}/artifacts
