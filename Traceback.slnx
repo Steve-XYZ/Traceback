@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Traceback.Api/Traceback.Api.csproj" />
+    <Project Path="src/Traceback.Application/Traceback.Application.csproj" />
+    <Project Path="src/Traceback.Connectors.Abstractions/Traceback.Connectors.Abstractions.csproj" />
+    <Project Path="src/Traceback.Connectors.Fixtures/Traceback.Connectors.Fixtures.csproj" />
+    <Project Path="src/Traceback.Connectors.GitHub/Traceback.Connectors.GitHub.csproj" />
+    <Project Path="src/Traceback.Domain/Traceback.Domain.csproj" />
+    <Project Path="src/Traceback.Infrastructure/Traceback.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Traceback.Tests.Domain/Traceback.Tests.Domain.csproj" />
+    <Project Path="tests/Traceback.Tests.Integration/Traceback.Tests.Integration.csproj" />
+  </Folder>
+</Solution>

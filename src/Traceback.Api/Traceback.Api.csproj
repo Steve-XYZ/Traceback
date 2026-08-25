@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Traceback.Application\Traceback.Application.csproj" />
+    <ProjectReference Include="..\Traceback.Connectors.Fixtures\Traceback.Connectors.Fixtures.csproj" />
+    <ProjectReference Include="..\Traceback.Connectors.GitHub\Traceback.Connectors.GitHub.csproj" />
+    <ProjectReference Include="..\Traceback.Infrastructure\Traceback.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

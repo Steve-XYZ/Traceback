@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <!-- Test method names use underscores for readability. -->
+    <NoWarn>$(NoWarn);CA1707;CA1859</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Traceback.Connectors.GitHub\Traceback.Connectors.GitHub.csproj" />
+    <ProjectReference Include="..\Traceback.Tests.GitHubSupport\Traceback.Tests.GitHubSupport.csproj" />
+  </ItemGroup>
+</Project>

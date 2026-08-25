@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Traceback.Connectors.GitHub\Traceback.Connectors.GitHub.csproj" />
+  </ItemGroup>
+</Project>

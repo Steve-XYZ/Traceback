@@ -1,0 +1,6 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Traceback.Domain\Traceback.Domain.csproj" />
+    <ProjectReference Include="..\Traceback.Connectors.Abstractions\Traceback.Connectors.Abstractions.csproj" />
+  </ItemGroup>
+</Project>
