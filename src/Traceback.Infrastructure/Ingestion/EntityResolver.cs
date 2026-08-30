@@ -302,10 +302,13 @@ internal sealed class EntityResolver(TracebackDbContext db)
             // Register any newly-learned aliases against the same artifact.
             foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
             {
-                if (alias != artifact.CanonicalKey)
-                    await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
+                await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
                 _artifactCache.TryAdd(alias!, artifact);
             }
+            if (artifact.Digest is null && descriptor.Digest is not null)
+                artifact.Digest = descriptor.Digest;
+            if (artifact.Uri is null && descriptor.Uri is not null)
+                artifact.Uri = descriptor.Uri;
             Touch(artifact, observedAt);
             return artifact;
         }
@@ -327,8 +330,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
         await db.BuildArtifacts.AddAsync(artifact, ct);
         foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
         {
-            if (alias != canonical)
-                await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
+            await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
             _artifactCache[alias!] = artifact;
         }
         return artifact;
@@ -495,7 +497,9 @@ internal sealed class EntityResolver(TracebackDbContext db)
     private async Task EnsureAliasAsync(BuildArtifact artifact, string aliasKey, string provider, DateTimeOffset observedAt, CancellationToken ct)
     {
         var exists = await db.ExternalIdentities.AnyAsync(
-            i => i.EntityTypeName == ExternalEntityTypes.BuildArtifact && i.ExternalKey == aliasKey, ct);
+            i => i.Provider == provider &&
+                 i.EntityTypeName == ExternalEntityTypes.BuildArtifact &&
+                 i.ExternalKey == aliasKey, ct);
         if (exists)
             return;
         var identity = new ExternalIdentity

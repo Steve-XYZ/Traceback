@@ -16,8 +16,9 @@ namespace Traceback.Connectors.GitHub;
 /// - Run completion: updated_at is only projected as CompletedAt when the run
 ///   status is "completed".
 /// - Actions artifacts map to BuildArtifact with a provider-stable canonical
-///   key hint; GitHub exposes no REST evidence linking a run to a container
-///   image, so no image relationship is ever fabricated here.
+///   key hint and GitHub's provider-stated SHA-256 archive digest; that digest
+///   is not treated as a container image digest, and no image relationship is
+///   fabricated here.
 /// </summary>
 internal sealed class GitHubEventMapper(string owner, string name)
 {
@@ -121,9 +122,18 @@ internal sealed class GitHubEventMapper(string owner, string name)
         new(
             Name: artifact.Name ?? $"artifact-{artifact.Id}",
             Version: null,
-            Digest: null,
+            Digest: artifact.Digest,
             Uri: artifact.ArchiveDownloadUrl,
             CanonicalKeyHint: $"{RepositoryKey}/actions/artifacts/{artifact.Id}");
+
+    public BuildArtifactObserved MapArtifactObserved(GitHubApiArtifact artifact, DateTimeOffset? fallbackOccurredAt = null)
+    {
+        var descriptor = MapArtifact(artifact);
+        var occurredAt = artifact.UpdatedAt ?? artifact.CreatedAt ?? fallbackOccurredAt ?? DateTimeOffset.UtcNow;
+        return new BuildArtifactObserved(
+            Provenance(ExternalEntityTypes.BuildArtifact, descriptor.CanonicalKeyHint!, descriptor.Uri, occurredAt),
+            descriptor);
+    }
 
     internal static string NormalizeSha(string? sha) => (sha ?? string.Empty).Trim().ToLowerInvariant();
 
@@ -146,4 +156,5 @@ internal static class ExternalEntityTypes
     public const string PullRequest = "pull_request";
     public const string Commit = "commit";
     public const string WorkflowRun = "workflow_run";
+    public const string BuildArtifact = "build_artifact";
 }

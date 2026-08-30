@@ -88,6 +88,66 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
     }
 
     [Fact]
+    public async Task Artifact_with_only_a_canonical_key_has_provider_evidence_and_is_idempotent()
+    {
+        var world = GitHubSyncHarness.NewWorld();
+        world.AddRun(
+            new FakeRun
+            {
+                Id = 778,
+                HeadSha = "artifactonly000000000000000000000000000000",
+                CreatedAt = TestTimes.Old,
+                UpdatedAt = TestTimes.Old,
+                RunStartedAt = TestTimes.Old,
+            },
+            [new FakeArtifact { Id = 7001, Name = "test-results" }]);
+
+        await using var app = await StartWithWorlds(postgres.Container, world);
+
+        AssertSynced(await SyncAllAsync(app));
+        Assert.Equal(
+            ["github|acme/player-manager/actions/artifacts/7001"],
+            await ArtifactIdentityKeysAsync(app));
+
+        var second = AssertSynced(await SyncAllAsync(app));
+
+        Assert.Equal(0, second.TotalObservationsApplied);
+        Assert.Equal(
+            ["github|acme/player-manager/actions/artifacts/7001"],
+            await ArtifactIdentityKeysAsync(app));
+    }
+
+    [Fact]
+    public async Task Artifact_digest_and_canonical_key_are_preserved_as_provider_aliases()
+    {
+        const string digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var world = GitHubSyncHarness.NewWorld();
+        world.AddRun(
+            new FakeRun
+            {
+                Id = 779,
+                HeadSha = "artifactalias00000000000000000000000000000",
+                CreatedAt = TestTimes.Old,
+                UpdatedAt = TestTimes.Old,
+                RunStartedAt = TestTimes.Old,
+            },
+            [new FakeArtifact { Id = 7002, Name = "test-results", Digest = digest }]);
+
+        await using var app = await StartWithWorlds(postgres.Container, world);
+
+        AssertSynced(await SyncAllAsync(app));
+        Assert.Equal(
+            [
+                $"github|acme/player-manager/actions/artifacts/7002",
+                $"github|{digest}",
+            ],
+            await ArtifactIdentityKeysAsync(app));
+
+        AssertSynced(await SyncAllAsync(app));
+        Assert.Equal(2, (await ArtifactIdentityKeysAsync(app)).Count);
+    }
+
+    [Fact]
     public async Task Admin_sync_endpoint_triggers_configured_repository_without_exposing_secrets()
     {
         var world = GitHubSyncHarness.NewWorld();
@@ -170,6 +230,12 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
             "WHERE sr.key = $1 AND p.number = $2", repositoryKey, number);
         return int.Parse(results[0], System.Globalization.CultureInfo.InvariantCulture);
     }
+
+    private static async Task<List<string>> ArtifactIdentityKeysAsync(TracebackApp app) =>
+        await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT provider || '|' || external_key FROM external_identities " +
+            "WHERE entity_type_name = 'build_artifact' ORDER BY external_key");
 }
 
 internal static class TestTimes

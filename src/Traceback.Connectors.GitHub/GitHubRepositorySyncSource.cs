@@ -30,8 +30,10 @@ namespace Traceback.Connectors.GitHub;
 ///   created >= watermark minus overlap AND enumerates all attempts of any run
 ///   whose run_attempt exceeds 1, so reruns are never reduced to their latest
 ///   attempt. Artifacts come from whichever GitHub listing is cheaper for the
-///   pass (see FetchArtifactsAsync) and attach to that run's highest observed
-///   attempt, because GitHub scopes artifacts to runs, not attempts.
+///   pass (see FetchArtifactsAsync). GitHub scopes artifacts to logical runs,
+///   not attempts: they attach only when the pass proves a single attempt;
+///   ambiguous artifacts remain standalone artifact observations until the
+///   model can represent a logical-run association.
 ///
 /// A pass never advances past truncated data: if the page cap is hit before a
 /// stream finishes walking its window, the previous watermark is returned
@@ -264,7 +266,7 @@ internal sealed class GitHubRepositorySyncSource(
 
         // Collect the attempts first and emit afterwards: knowing how many runs
         // the pass covers is what lets the artifact fetch pick a strategy.
-        var runs = new List<(long RunId, List<GitHubApiWorkflowRun> Attempts)>();
+        var runs = new List<(long RunId, List<GitHubApiWorkflowRun> Attempts, bool ArtifactsAttributable)>();
 
         string? nextUrl = null;
         var pagesWalked = 0;
@@ -300,7 +302,11 @@ internal sealed class GitHubRepositorySyncSource(
                     attempts = [run];
                 }
 
-                runs.Add((run.Id, attempts.OrderBy(a => Math.Max(1, a.RunAttempt)).ToList()));
+                var orderedAttempts = attempts.OrderBy(a => Math.Max(1, a.RunAttempt)).ToList();
+                var artifactsAttributable = Math.Max(1, run.RunAttempt) == 1 &&
+                    orderedAttempts.Count == 1 &&
+                    Math.Max(1, orderedAttempts[0].RunAttempt) == 1;
+                runs.Add((run.Id, orderedAttempts, artifactsAttributable));
             }
 
             if (!page.HasNext)
@@ -318,18 +324,22 @@ internal sealed class GitHubRepositorySyncSource(
         var events = new List<TracebackEvent>(runs.Sum(r => r.Attempts.Count));
         using (StartNormalize("workflow_runs", runs.Count))
         {
-            foreach (var (runId, attempts) in runs)
+            foreach (var (runId, attempts, artifactsAttributable) in runs)
             {
                 var descriptors = artifactsByRun.TryGetValue(runId, out var found)
-                    ? found.ConvertAll(mapper.MapArtifact)
+                    ? artifactsAttributable ? found.ConvertAll(mapper.MapArtifact) : []
                     : [];
 
-                // Artifacts belong to the run as a whole; attach them to the
-                // highest attempt observed in this pass (deterministic rule).
+                if (!artifactsAttributable && found is { Count: > 0 })
+                {
+                    var fallbackArtifactTime = attempts.LastOrDefault()?.UpdatedAt ?? attempts.LastOrDefault()?.CreatedAt;
+                    foreach (var artifact in found)
+                        events.Add(mapper.MapArtifactObserved(artifact, fallbackArtifactTime));
+                }
+
                 for (var i = 0; i < attempts.Count; i++)
                 {
-                    var isHighest = i == attempts.Count - 1;
-                    events.Add(mapper.MapWorkflowRun(attempts[i], isHighest ? descriptors : []));
+                    events.Add(mapper.MapWorkflowRun(attempts[i], descriptors));
                 }
             }
         }

@@ -110,10 +110,11 @@ reference arrives: identity mapping first, natural key second, creation as
 placeholder last.
 
 Artifacts deserve special mention: container tags move, digests do not. An
-artifact's canonical key is fixed at first sight (digest if known, else
-`name@version`), and additional identities are registered as aliases when new
-identifiers are learned later. References stay stable regardless of which
-identifier arrived first.
+artifact's canonical key is fixed at first sight (provider-reported digest if
+known, else a provider key or `name@version`), and additional identities are
+registered as aliases when new identifiers are learned later. A provider digest
+is source metadata, not a container-image assertion. References stay stable
+regardless of which identifier arrived first.
 
 **Provenance of individual facts** is the append-only `observations` log: every
 accepted event is stored once with provider, entity type, external key,
@@ -390,11 +391,12 @@ Traceback keys runs on `(repository, run id, attempt)` instead. Concretely:
 - query results expose `runId` and `runAttempt`, so a caller can distinguish
   "run 98122 failed, then succeeded on retry" from "two unrelated runs".
 
-Artifacts are scoped by GitHub to a run, not to an attempt. The connector
-attaches them to the highest attempt observed in that pass, and the edge table
-keeps the earlier attempt's edge from a previous pass — so the history reads
-"attempt 1 produced drop, attempt 2 produced drop", which is what actually
-happened when a rerun rebuilds the same artifact name.
+Artifacts are scoped by GitHub to a logical run, not to an attempt. The
+connector attaches them only when the pass has one known attempt. Once a rerun
+is visible, it retains the artifact observation and provider identity but does
+not choose an attempt-specific edge. The current edge schema cannot represent
+the logical-run association separately from an attempt, so that association is
+explicitly unknown until the model is extended.
 
 Fetching those artifacts has two possible shapes (per run, or one repository-wide
 listing) whose costs differ by orders of magnitude depending on the pass. The
@@ -417,7 +419,7 @@ that said so. Observed relationships in the GitHub connector:
 |---|---|
 | PullRequest → Commit | the PR's own commit listing, plus the head SHA stated by the PR object |
 | WorkflowRun → Commit | the run's `head_sha` |
-| WorkflowRun → BuildArtifact | the run's artifact listing |
+| WorkflowRun → BuildArtifact | the run's artifact listing, when one attempt is known |
 | PullRequest/Commit/Run → SourceRepository | the endpoint the object was fetched from |
 | Commit → Engineer | the commit's author/committer blocks |
 

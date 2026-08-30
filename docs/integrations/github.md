@@ -92,7 +92,7 @@ failed stream.
 | Commit | `GET /repos/{o}/{r}/commits?since=…` | `Commit` |
 | Workflow run | `GET /repos/{o}/{r}/actions/runs?created=>=…` | `WorkflowRun` |
 | Workflow run attempt | `GET /repos/{o}/{r}/actions/runs/{id}/attempts` | one `WorkflowRun` row per attempt |
-| Actions artifact | `GET /repos/{o}/{r}/actions/artifacts` or `GET .../runs/{id}/artifacts` | `BuildArtifact` + `WorkflowRunArtifact` edge |
+| Actions artifact | `GET /repos/{o}/{r}/actions/artifacts` or `GET .../runs/{id}/artifacts` | `BuildArtifact`; `WorkflowRunArtifact` when one attempt is known |
 | Commit author/committer | embedded in commit and PR payloads | `Engineer` |
 
 Field mapping worth knowing:
@@ -108,7 +108,11 @@ Field mapping worth knowing:
   `timed_out`, `skipped`, `neutral`, `action_required`. Nothing is collapsed
   into a coarser status.
 - **Artifacts** get the canonical key `{owner}/{repo}/actions/artifacts/{id}`.
-  GitHub exposes no digest for them, so `digest` stays null.
+  GitHub's `digest` field is stored as provider-reported archive metadata. It
+  is not treated as a container-image digest or used to create an image link.
+
+Every REST request sends `X-GitHub-Api-Version: 2026-03-10`, the currently
+supported public GitHub REST contract.
 
 ## Initial synchronization
 
@@ -133,7 +137,7 @@ checkpoint does not move, and the next pass redoes the window.
 ### Two ways to fetch artifacts
 
 GitHub lists artifacts per run (`.../runs/{id}/artifacts`) and repository-wide
-(`.../actions/artifacts`, where each artifact names its `workflow_run.id`).
+(`.../actions/artifacts`, where each artifact names its logical `workflow_run.id`).
 Which is cheaper depends on the pass, and the difference is large enough to
 matter against a 5000-requests-per-hour budget:
 
@@ -145,7 +149,8 @@ matter against a 5000-requests-per-hour budget:
 The connector spends one probe request on the repository listing, reads
 `total_count`, and takes the cheaper path: repository-wide when
 `ceil(total_count / PageSize) <= min(runs in this pass, MaxPagesPerFetch)`,
-per-run otherwise. Both paths produce identical artifact rows and edges; the
+per-run otherwise. Both paths produce identical artifact observations and the
+same attempt-attribution behavior; the
 active choice is on the `github.fetch.artifacts` span as
 `traceback.github.artifact_strategy`.
 
@@ -229,13 +234,15 @@ The point of the connector is to import evidence, not to infer a story around
 it. Deliberately absent:
 
 - **No container image linkage.** GitHub Actions exposes no REST evidence that a
-  workflow run pushed a particular image digest. Workflow evidence is stored and
-  the deployment relationship stays unresolved. A registry or deployment
-  connector will supply it.
+  workflow run pushed a particular image digest. An Actions archive digest is
+  not an image digest. Workflow evidence is stored and the deployment
+  relationship stays unresolved. A registry or deployment connector will
+  supply it.
 - **No artifact content.** Artifact archives are not downloaded; only the
-  metadata GitHub lists (id, name, size, download URL, expiry). Expired
-  artifacts drop out of GitHub's listings, so an old run may keep an artifact
-  edge from an earlier pass while GitHub no longer reports the artifact.
+  metadata GitHub lists (id, name, size, archive digest, download URL, expiry).
+  Expired artifacts drop out of GitHub's listings, so an old run may keep an
+  artifact edge from an earlier pass while GitHub no longer reports the
+  artifact.
 - **No inference of which pull request "introduced" a commit** beyond what
   GitHub's own pull-request commit listing states.
 - **No issues, reviews, comments, checks, statuses, releases, tags, branches or

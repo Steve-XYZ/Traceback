@@ -14,12 +14,17 @@ public sealed class BuildArtifact : IExternallySourced
     /// <summary>Mutable version label, e.g. a tag like "be82d".</summary>
     public string? Version { get; set; }
 
-    /// <summary>Content digest, e.g. "sha256:...". Immutable when present.</summary>
+    /// <summary>
+    /// Provider-reported content digest, e.g. "sha256:...". This is not a
+    /// container-image digest unless a provider separately proves that fact.
+    /// Immutable when present.
+    /// </summary>
     public string? Digest { get; set; }
 
     /// <summary>
     /// Stable resolution key used to correlate artifact references across providers:
-    /// the digest when known, otherwise "name@version".
+    /// the provider-reported digest when known, otherwise a provider key or
+    /// "name@version".
     /// </summary>
     public string CanonicalKey { get; set; } = null!;
 

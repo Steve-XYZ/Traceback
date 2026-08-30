@@ -105,7 +105,7 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
     }
 
     [Fact]
-    public async Task Rerun_enumerates_every_attempt_and_attaches_artifacts_to_the_highest()
+    public async Task Rerun_enumerates_every_attempt_without_claiming_an_artifact_attempt()
     {
         // The runs listing exposes only the latest attempt (attempt 2 here);
         // the attempts endpoint enumerates the full rerun history.
@@ -155,10 +155,34 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
         Assert.Equal("failure", runEvents[0].Conclusion);
         Assert.Equal("success", runEvents[1].Conclusion);
         Assert.All(runEvents, e => Assert.Equal(98122, e.RunId));
-        // Attempt 1 keeps its historical identity; artifacts attach once.
+        // The artifact response names only logical run 98122. Neither attempt
+        // can be named as its producer without inventing evidence.
         Assert.Empty(runEvents[0].ProducedArtifacts);
-        Assert.Single(runEvents[1].ProducedArtifacts);
-        Assert.Contains("acme/player-manager/actions/artifacts/5001", runEvents[1].ProducedArtifacts[0].CanonicalKeyHint, StringComparison.Ordinal);
+        Assert.Empty(runEvents[1].ProducedArtifacts);
+        var artifact = Assert.Single(result.Events.OfType<BuildArtifactObserved>());
+        Assert.Equal("acme/player-manager/actions/artifacts/5001", artifact.Provenance.ExternalKey);
+        Assert.Equal("acme/player-manager/actions/artifacts/5001", artifact.Artifact.CanonicalKeyHint);
+    }
+
+    [Fact]
+    public async Task Artifact_digest_is_carried_as_provider_metadata()
+    {
+        const string digest = "sha256:cfc3236bdad15b5898bca8408945c9e19e1917da8704adc20eaa618444290a8c";
+        World.AddRun(
+            new FakeRun
+            {
+                Id = 1234,
+                HeadSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                CreatedAt = Now,
+                UpdatedAt = Now,
+                RunStartedAt = Now,
+            },
+            [new FakeArtifact { Id = 6001, Name = "test-results", Digest = digest }]);
+
+        var result = await _source.FetchAsync(Fetch("workflow_runs", cursor: null));
+
+        var artifact = Assert.Single(result.Events.OfType<WorkflowRunObserved>()).ProducedArtifacts;
+        Assert.Equal(digest, Assert.Single(artifact).Digest);
     }
 
     [Fact]

@@ -286,6 +286,7 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
         size_in_bytes = a.SizeInBytes,
         archive_download_url = $"https://api.github.test/download/{a.Id}",
         expired = a.Expired,
+        digest = a.Digest,
         created_at = a.CreatedAt?.ToString("O"),
         updated_at = a.UpdatedAt?.ToString("O"),
         workflow_run = runId is null ? null : new { id = runId.Value },
