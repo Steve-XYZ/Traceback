@@ -172,7 +172,9 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
             $"{digest}|{uri}",
             (await GitHubSyncHarness.QueryAsync(
                 app,
-                "SELECT digest || '|' || uri FROM build_artifacts WHERE canonical_key = $1",
+                "SELECT a.digest || '|' || a.uri FROM build_artifacts a " +
+                "JOIN external_identities i ON i.build_artifact_id = a.id " +
+                "WHERE i.provider = 'github' AND i.external_key = $1",
                 canonicalKey))[0]);
         Assert.Equal(
             [
@@ -180,6 +182,87 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
                 $"github|{digest}",
             ],
             await ArtifactIdentityKeysAsync(app));
+    }
+
+    [Fact]
+    public async Task Provider_scoped_artifact_keys_do_not_cross_correlate_when_digests_differ()
+    {
+        const string externalKey = "shared/build-output";
+        const string firstDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const string secondDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        var occurredAt = new DateTimeOffset(2026, 8, 24, 10, 0, 0, TimeSpan.Zero);
+        var observedAt = new DateTimeOffset(2026, 8, 25, 10, 0, 0, TimeSpan.Zero);
+        var first = new BuildArtifactObserved(
+            new EventProvenance("provider-a", "build_artifact", externalKey, null, occurredAt, observedAt),
+            new ArtifactDescriptor("build-output", null, firstDigest, null, externalKey));
+        var second = new BuildArtifactObserved(
+            new EventProvenance("provider-b", "build_artifact", externalKey, null, occurredAt, observedAt),
+            new ArtifactDescriptor("build-output", null, secondDigest, null, externalKey));
+
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+
+        var result = await app.IngestAsync([first, second]);
+
+        Assert.Equal(2, result.Applied);
+        Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
+        Assert.Equal(
+            [firstDigest, secondDigest],
+            await GitHubSyncHarness.QueryAsync(app, "SELECT digest FROM build_artifacts ORDER BY digest"));
+    }
+
+    [Fact]
+    public async Task Digestless_provider_keys_remain_distinct_and_persistable()
+    {
+        const string externalKey = "shared/build-output";
+        var occurredAt = new DateTimeOffset(2026, 8, 24, 10, 0, 0, TimeSpan.Zero);
+        var observedAt = new DateTimeOffset(2026, 8, 25, 10, 0, 0, TimeSpan.Zero);
+        var first = new BuildArtifactObserved(
+            new EventProvenance("provider-a", "build_artifact", externalKey, null, occurredAt, observedAt),
+            new ArtifactDescriptor("build-output", null, null, null, externalKey));
+        var second = new BuildArtifactObserved(
+            new EventProvenance("provider-b", "build_artifact", externalKey, null, occurredAt, observedAt),
+            new ArtifactDescriptor("build-output", null, null, null, externalKey));
+
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+
+        var result = await app.IngestAsync([first, second]);
+
+        Assert.Equal(2, result.Applied);
+        Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
+        Assert.Equal(
+            [
+                $"provider-a|provider-a|{externalKey}",
+                $"provider-b|provider-b|{externalKey}",
+            ],
+            await GitHubSyncHarness.QueryAsync(
+                app,
+                "SELECT created_by_provider || '|' || canonical_key FROM build_artifacts " +
+                "ORDER BY created_by_provider"));
+    }
+
+    [Fact]
+    public async Task Same_digest_correlates_artifacts_across_providers()
+    {
+        const string digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        var occurredAt = new DateTimeOffset(2026, 8, 24, 10, 0, 0, TimeSpan.Zero);
+        var observedAt = new DateTimeOffset(2026, 8, 25, 10, 0, 0, TimeSpan.Zero);
+        var first = new BuildArtifactObserved(
+            new EventProvenance("provider-a", "build_artifact", "provider-a/output", null, occurredAt, observedAt),
+            new ArtifactDescriptor("build-output", null, digest, null, "provider-a/output"));
+        var second = new BuildArtifactObserved(
+            new EventProvenance("provider-b", "build_artifact", "provider-b/output", null, occurredAt, observedAt),
+            new ArtifactDescriptor("build-output", null, digest, null, "provider-b/output"));
+
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+
+        var result = await app.IngestAsync([first, second]);
+
+        Assert.Equal(2, result.Applied);
+        Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
+        Assert.Equal(
+            [digest],
+            await GitHubSyncHarness.QueryAsync(app, "SELECT digest FROM build_artifacts"));
+        Assert.Equal(4, (await ArtifactIdentityKeysAsync(app)).Count);
     }
 
     [Fact]

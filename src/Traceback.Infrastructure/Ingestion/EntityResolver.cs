@@ -27,7 +27,9 @@ internal sealed class EntityResolver(TracebackDbContext db)
 {
     private readonly Dictionary<(string Provider, string EntityType, string Key), object> _entityCache = [];
     private readonly Dictionary<string, Engineer> _engineerCache = [];
-    private readonly Dictionary<string, BuildArtifact> _artifactCache = [];
+    // Digest aliases are global content identities; provider-stable artifact
+    // keys stay in their provider namespace.
+    private readonly Dictionary<(string? Provider, string Key), BuildArtifact> _artifactCache = [];
     private readonly Dictionary<(string Provider, string Name), Service> _serviceCache = [];
     private readonly Dictionary<(string Provider, string Name), DeploymentEnvironment> _environmentCache = [];
 
@@ -257,10 +259,11 @@ internal sealed class EntityResolver(TracebackDbContext db)
     }
 
     /// <summary>
-    /// Artifacts are resolved by alias identities: digest first (content
-    /// identity), then a provider-stable external key hint, then name@version.
-    /// Identifiers learned later are registered as additional aliases so
-    /// references remain stable regardless of which identifier arrived first.
+    /// Artifacts are resolved by alias identities: digest first (global content
+    /// identity), then a provider-stable external key hint, then name@version
+    /// in the provider namespace. Identifiers learned later are registered as
+    /// additional aliases so references remain stable regardless of which
+    /// identifier arrived first.
     /// </summary>
     public async Task<BuildArtifact> ResolveArtifactAsync(string provider, ArtifactDescriptor descriptor, DateTimeOffset observedAt, CancellationToken ct)
     {
@@ -273,42 +276,40 @@ internal sealed class EntityResolver(TracebackDbContext db)
         // not be flushed yet, so database lookups alone would duplicate them.
         // Keep the hit in the normal merge path below: a later descriptor can
         // add a digest, URI, or alias to an artifact already seen in this batch.
-        foreach (var key in new[] { digestKey, externalKey, versionKey })
+        foreach (var cacheKey in ArtifactCacheKeys(provider, digestKey, externalKey, versionKey))
         {
-            if (key is not null && _artifactCache.TryGetValue(key, out var cachedArtifact))
+            if (_artifactCache.TryGetValue(cacheKey, out var cachedArtifact))
             {
                 artifact = cachedArtifact;
                 break;
             }
         }
 
-        ExternalIdentity? matchedIdentity = null;
-
         if (digestKey is not null)
         {
-            matchedIdentity = await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, digestKey, ct);
-            artifact ??= await LoadAsync<BuildArtifact>(matchedIdentity?.BuildArtifactId, ct)
-                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == digestKey, ct);
+            var identity = await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, digestKey, ct);
+            artifact ??= await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
+                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.Digest == digestKey, ct);
         }
         if (artifact is null && externalKey is not null)
         {
-            matchedIdentity ??= await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, externalKey, ct);
-            artifact ??= await LoadAsync<BuildArtifact>(matchedIdentity?.BuildArtifactId, ct)
-                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == externalKey, ct);
+            var identity = await FindIdentityAsync(provider, ExternalEntityTypes.BuildArtifact, externalKey, ct);
+            artifact ??= await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
+                ?? await FindProviderCanonicalArtifactAsync(provider, externalKey, ct);
         }
         if (artifact is null && versionKey is not null)
         {
-            matchedIdentity ??= await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, versionKey, ct);
-            artifact ??= await LoadAsync<BuildArtifact>(matchedIdentity?.BuildArtifactId, ct)
-                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == versionKey, ct);
+            var identity = await FindIdentityAsync(provider, ExternalEntityTypes.BuildArtifact, versionKey, ct);
+            artifact ??= await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
+                ?? await FindProviderCanonicalArtifactAsync(provider, versionKey, ct);
         }
         if (artifact is not null)
         {
             // Register any newly-learned aliases against the same artifact.
-            foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
+            foreach (var cacheKey in ArtifactCacheKeys(provider, digestKey, externalKey, versionKey))
             {
-                await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
-                _artifactCache.TryAdd(alias!, artifact);
+                await EnsureAliasAsync(artifact, cacheKey.Key, provider, observedAt, ct);
+                _artifactCache.TryAdd(cacheKey, artifact);
             }
             if (artifact.Digest is null && descriptor.Digest is not null)
                 artifact.Digest = descriptor.Digest;
@@ -318,8 +319,12 @@ internal sealed class EntityResolver(TracebackDbContext db)
             return artifact;
         }
 
-        // Unknown artifact: create with the most specific canonical key available.
-        var canonical = digestKey ?? externalKey ?? versionKey ?? throw new ArgumentException("Artifact descriptor must carry a digest, a canonical key hint, or a version.", nameof(descriptor));
+        // Unknown artifact: content digests are globally unique. Provider keys
+        // and version labels are not, so namespace their persisted canonical
+        // fallback while retaining the raw value as an ExternalIdentity alias.
+        var canonical = digestKey
+            ?? ProviderScopedCanonicalKey(provider, externalKey ?? versionKey
+                ?? throw new ArgumentException("Artifact descriptor must carry a digest, a canonical key hint, or a version.", nameof(descriptor)));
         artifact = new BuildArtifact
         {
             Name = descriptor.Name.Trim(),
@@ -333,10 +338,10 @@ internal sealed class EntityResolver(TracebackDbContext db)
             IsPlaceholder = true,
         };
         await db.BuildArtifacts.AddAsync(artifact, ct);
-        foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
+        foreach (var cacheKey in ArtifactCacheKeys(provider, digestKey, externalKey, versionKey))
         {
-            await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
-            _artifactCache[alias!] = artifact;
+            await EnsureAliasAsync(artifact, cacheKey.Key, provider, observedAt, ct);
+            _artifactCache[cacheKey] = artifact;
         }
         return artifact;
     }
@@ -449,6 +454,14 @@ internal sealed class EntityResolver(TracebackDbContext db)
         db.ExternalIdentities
             .FirstOrDefaultAsync(i => i.EntityTypeName == entityType && i.ExternalKey == key, ct);
 
+    private Task<BuildArtifact?> FindProviderCanonicalArtifactAsync(string provider, string key, CancellationToken ct)
+    {
+        var scopedKey = ProviderScopedCanonicalKey(provider, key);
+        return db.BuildArtifacts.FirstOrDefaultAsync(
+            a => a.CreatedByProvider == provider &&
+                 (a.CanonicalKey == key || a.CanonicalKey == scopedKey), ct);
+    }
+
     private async Task AttachIdentityAsync(
         ExternalIdentity? existingIdentity,
         string entityType,
@@ -525,6 +538,20 @@ internal sealed class EntityResolver(TracebackDbContext db)
         };
         await db.ExternalIdentities.AddAsync(identity, ct);
     }
+
+    private static IEnumerable<(string? Provider, string Key)> ArtifactCacheKeys(
+        string provider, string? digestKey, string? externalKey, string? versionKey)
+    {
+        if (digestKey is not null)
+            yield return (null, digestKey);
+        if (externalKey is not null)
+            yield return (provider, externalKey);
+        if (versionKey is not null)
+            yield return (provider, versionKey);
+    }
+
+    private static string ProviderScopedCanonicalKey(string provider, string key) =>
+        $"{provider}|{key}";
 
     internal static void Touch(IExternallySourced entity, DateTimeOffset observedAt)
     {

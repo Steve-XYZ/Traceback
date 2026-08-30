@@ -111,10 +111,13 @@ placeholder last.
 
 Artifacts deserve special mention: container tags move, digests do not. An
 artifact's canonical key is fixed at first sight (provider-reported digest if
-known, else a provider key or `name@version`), and additional identities are
-registered as aliases when new identifiers are learned later. A provider digest
-is source metadata, not a container-image assertion. References stay stable
-regardless of which identifier arrived first.
+known, else a provider-qualified key or `name@version`), and additional
+identities are registered as aliases when new identifiers are learned later.
+Provider-key and version aliases stay in their provider namespace; digest
+identities are global content identities. A provider digest is source metadata,
+not a container-image assertion. References stay stable regardless of which
+identifier arrived first. Legacy artifacts with an unqualified canonical key
+remain resolvable through their owning provider's aliases.
 
 **Provenance of individual facts** is the append-only `observations` log: every
 accepted event is stored once with provider, entity type, external key,

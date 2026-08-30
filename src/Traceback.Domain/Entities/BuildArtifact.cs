@@ -22,9 +22,12 @@ public sealed class BuildArtifact : IExternallySourced
     public string? Digest { get; set; }
 
     /// <summary>
-    /// Stable resolution key used to correlate artifact references across providers:
-    /// the provider-reported digest when known, otherwise a provider key or
-    /// "name@version".
+    /// Stable resolution key used to correlate artifact references: the
+    /// provider-reported digest when known, otherwise a provider-qualified
+    /// form of the first provider key or "name@version" seen. The raw
+    /// provider key remains in ExternalIdentity; digest identities may
+    /// correlate across providers. Legacy rows with an unqualified key remain
+    /// resolvable within their owning provider.
     /// </summary>
     public string CanonicalKey { get; set; } = null!;
 
