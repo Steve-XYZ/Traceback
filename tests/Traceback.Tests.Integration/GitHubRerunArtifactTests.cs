@@ -7,7 +7,7 @@ namespace Traceback.Tests.Integration;
 /// <summary>
 /// Actions reruns and artifacts: every rerun attempt keeps its own historical
 /// row (reruns never reduce a run to its latest attempt), artifacts attach to
-/// the highest attempt observed in a pass, an in-progress run completes in
+/// a run only when that attempt is unambiguous, an in-progress run completes in
 /// place rather than spawning a second row, and artifacts published after a
 /// run are picked up by a later pass.
 /// </summary>
@@ -29,13 +29,13 @@ public sealed class GitHubRerunArtifactTests(PostgresContainerFixture postgres)
 
         await using var app = await StartWithWorldsAsync(postgres.Container, world);
 
-        // One historical row per (run id, attempt); the artifact rides on the
-        // highest attempt observed in this pass.
+        // One historical row per (run id, attempt). The artifact is retained,
+        // but its logical run id cannot identify either attempt.
         AssertSynced(await GitHubSyncHarness.SyncAsync(app));
         Assert.Equal(2, await CountRunsAsync(app));
         Assert.Equal([1, 2], await RunAttemptsAsync(app, RunId));
         Assert.Equal("failure", await RunScalarAsync(app, "conclusion", RunId, attempt: 2));
-        Assert.Equal([2], await ArtifactEdgeAttemptsAsync(app, RunId));
+        Assert.Empty(await ArtifactEdgeAttemptsAsync(app, RunId));
         Assert.Equal(1, await CountArtifactsAsync(app));
     }
 
@@ -62,9 +62,10 @@ public sealed class GitHubRerunArtifactTests(PostgresContainerFixture postgres)
         Assert.Equal(2, await CountRunsAsync(app));
         Assert.Equal("success", await RunScalarAsync(app, "conclusion", RunId, attempt: 1));
         Assert.Equal("failure", await RunScalarAsync(app, "conclusion", RunId, attempt: 2));
-        // Artifact edges are additive history: attempt 1 kept its link, and
-        // the rerun pass attached the artifact to the new highest attempt.
-        Assert.Equal([1, 2], await ArtifactEdgeAttemptsAsync(app, RunId));
+        // The first pass had one known attempt, so its edge remains. Once the
+        // rerun is visible, the logical artifact response cannot justify a new
+        // edge to attempt 2.
+        Assert.Equal([1], await ArtifactEdgeAttemptsAsync(app, RunId));
         Assert.Equal(1, await CountArtifactsAsync(app));
     }
 

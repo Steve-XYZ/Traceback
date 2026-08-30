@@ -239,6 +239,10 @@ internal sealed class GitHubApiArtifact
     [JsonPropertyName("expired")]
     public bool Expired { get; set; }
 
+    /// <summary>GitHub's SHA-256 digest for the archived artifact.</summary>
+    [JsonPropertyName("digest")]
+    public string? Digest { get; set; }
+
     /// <summary>
     /// Present on the repository-level artifacts listing, absent on the
     /// per-run listing (where the run is implied by the URL).

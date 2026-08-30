@@ -62,8 +62,13 @@ public sealed class GitHubReadApiTests(PostgresContainerFixture postgres)
         Assert.Equal("success", headRun.GetProperty("workflowRun").GetProperty("conclusion").GetString());
         var artifact = Assert.Single(headRun.GetProperty("artifacts").EnumerateArray().ToList());
         Assert.Equal("drop", artifact.GetProperty("name").GetString());
-        // GitHub states no image digest for Actions artifacts, so none is invented.
-        Assert.True(artifact.GetProperty("digest").ValueKind == JsonValueKind.Null);
+        Assert.Equal(
+            "sha256:cfc3236bdad15b5898bca8408945c9e19e1917da8704adc20eaa618444290a8c",
+            artifact.GetProperty("digest").GetString());
+        Api.AssertHasSources(artifact, "artifact");
+        Assert.Contains(
+            artifact.GetProperty("sources").EnumerateArray(),
+            source => source.GetProperty("externalKey").GetString() == "acme/player-manager/actions/artifacts/5001");
     }
 
     [Fact]
@@ -234,7 +239,12 @@ public sealed class GitHubReadApiTests(PostgresContainerFixture postgres)
                 RunStartedAt = T0.AddHours(-4),
                 UpdatedAt = T0.AddHours(-4).AddMinutes(6),
             },
-            [new FakeArtifact { Id = 5001, Name = "drop" }]);
+            [new FakeArtifact
+            {
+                Id = 5001,
+                Name = "drop",
+                Digest = "sha256:cfc3236bdad15b5898bca8408945c9e19e1917da8704adc20eaa618444290a8c",
+            }]);
 
         world.AddRun(new FakeRun
         {

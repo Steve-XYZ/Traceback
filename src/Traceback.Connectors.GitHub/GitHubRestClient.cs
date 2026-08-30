@@ -19,12 +19,15 @@ namespace Traceback.Connectors.GitHub;
 ///   then fails if the limit persists. Otherwise it fails fast with
 ///   GitHubRateLimitException carrying the reset time so synchronization can
 ///   stop deliberately instead of hot-looping.
+/// - Requests pin the currently supported GitHub REST API version explicitly.
 /// </summary>
 internal sealed partial class GitHubRestClient(
     HttpClient httpClient,
     IGitHubTokenProvider tokenProvider,
     IOptionsMonitor<GitHubConnectorOptions> options) : IGitHubApiClient
 {
+    internal const string ApiVersion = "2026-03-10";
+
     internal static readonly Meter Meter = new("Traceback.Sync");
     private static readonly Counter<long> ApiRequests =
         Meter.CreateCounter<long>("traceback.sync.api_requests", description: "GitHub API requests sent.");
@@ -253,6 +256,7 @@ internal sealed partial class GitHubRestClient(
         var request = new HttpRequestMessage(method, uri);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", tokenProvider.GetToken());
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        request.Headers.Add("X-GitHub-Api-Version", ApiVersion);
         request.Headers.UserAgent.ParseAdd("traceback");
         return request;
     }

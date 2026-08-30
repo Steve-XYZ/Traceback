@@ -61,6 +61,7 @@ public sealed class FakeArtifact
     public required string Name { get; init; }
     public long SizeInBytes { get; set; } = 1024;
     public bool Expired { get; set; }
+    public string? Digest { get; set; }
     public DateTimeOffset? CreatedAt { get; set; }
     public DateTimeOffset? UpdatedAt { get; set; }
 }

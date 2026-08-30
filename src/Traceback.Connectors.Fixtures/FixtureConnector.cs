@@ -30,6 +30,7 @@ public sealed class FixtureConnector : IConnector
     private const string PreviousCommitSha = "aa12e5b3c0d4e5a6b7c8d9e0f1a2b3c4d5e6f708";
     private const string PreviousRunName = $"{RepositoryFullName}/actions/runs/98100/attempts/1";
     private const string PreviousArtifactTag = "aa12e";
+    private const string PreviousArtifactDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
     private static readonly DateTimeOffset TicketOpenedAt = new(2026, 08, 17, 09, 12, 00, TimeSpan.Zero);
     private static readonly DateTimeOffset PrOpenedAt = new(2026, 08, 20, 10, 15, 00, TimeSpan.Zero);
@@ -96,10 +97,10 @@ public sealed class FixtureConnector : IConnector
             Observed(github, ExternalEntity.WorkflowRun, PreviousRunName, null, PreviousDeployedAt,
                 (_, p) => new WorkflowRunObserved(p, PreviousRunName, "player-manager-ci", 98100, "completed", "success",
                     PreviousRunCompletedAt.AddMinutes(-14), PreviousRunCompletedAt, PreviousCommitSha,
-                    [new ArtifactDescriptor(ArtifactName, PreviousArtifactTag, null, $"registry.acme.dev/{ArtifactName}:{PreviousArtifactTag}")],
+                    [new ArtifactDescriptor(ArtifactName, PreviousArtifactTag, PreviousArtifactDigest, $"registry.acme.dev/{ArtifactName}:{PreviousArtifactTag}")],
                     Repository: RepositoryFullName, RunId: 98100, RunAttempt: 1)),
             Observed(docker, ExternalEntity.BuildArtifact, $"{ArtifactName}@{PreviousArtifactTag}", $"registry.acme.dev/{ArtifactName}:{PreviousArtifactTag}", PreviousDeployedAt,
-                (_, p) => new BuildArtifactObserved(p, new ArtifactDescriptor(ArtifactName, PreviousArtifactTag, null, $"registry.acme.dev/{ArtifactName}:{PreviousArtifactTag}"))),
+                (_, p) => new BuildArtifactObserved(p, new ArtifactDescriptor(ArtifactName, PreviousArtifactTag, PreviousArtifactDigest, $"registry.acme.dev/{ArtifactName}:{PreviousArtifactTag}"))),
             Observed(docker, ExternalEntity.Deployment, $"{ServiceName}/{EnvironmentName}/{PreviousArtifactTag}", null, PreviousDeployedAt,
                 (_, p) => new DeploymentObserved(p, ServiceName, EnvironmentName,
                     new ArtifactDescriptor(ArtifactName, PreviousArtifactTag, null, null),

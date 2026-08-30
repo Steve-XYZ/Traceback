@@ -77,8 +77,9 @@ internal interface IGitHubApiClient
 
     /// <summary>
     /// One page of the repository-wide artifacts listing. Each artifact names
-    /// the run that produced it, so a whole pass's artifacts can be fetched in
-    /// a few requests instead of one per run.
+    /// the logical run that produced it, so a whole pass's artifacts can be
+    /// fetched in a few requests instead of one per run. The response does not
+    /// identify a rerun attempt.
     /// </summary>
     Task<GitHubArtifactsPage> GetRepositoryArtifactsPageAsync(
         string owner, string name, string? nextPageUrl, int pageSize, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default);

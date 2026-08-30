@@ -129,6 +129,7 @@ public sealed class GitHubRestClientBehaviorTests : IDisposable
         await _client.GetRepositoryAsync("acme", "player-manager");
 
         Assert.Equal("Bearer tb-secret-token-value", _handler.Requests[0].Headers.Authorization?.ToString());
+        Assert.Equal("2026-03-10", _handler.Requests[0].Headers.GetValues("X-GitHub-Api-Version").Single());
         Assert.Contains(_handler.Requests[0].Headers.UserAgent, h => h.Product is { Name: "traceback" });
     }
 
