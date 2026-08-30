@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 10.0.400
+
+      - name: Restore
+        run: dotnet restore Traceback.slnx
+
+      - name: Release build
+        run: dotnet build Traceback.slnx --configuration Release --no-restore
+
+      - name: Verify format
+        run: dotnet format Traceback.slnx --verify-no-changes --no-restore
+
+      - name: Run tests
+        run: dotnet test Traceback.slnx --configuration Release --no-build --no-restore
+
+      - name: Restore local tools
+        run: dotnet tool restore
+
+      - name: Check EF model is current
+        run: dotnet ef migrations has-pending-model-changes --project src/Traceback.Infrastructure --startup-project src/Traceback.Api
+
+      - name: Test vulnerability gate
+        run: bash scripts/test-check-vulnerabilities.sh
+
+      - name: Audit vulnerable packages
+        run: bash scripts/check-vulnerabilities.sh
+
+      - name: Build benchmark project
+        run: dotnet build tests/Traceback.Benchmark/Traceback.Benchmark.csproj --configuration Release --no-restore
+
+      - name: Build Docker image
+        run: docker build --tag traceback:ci .

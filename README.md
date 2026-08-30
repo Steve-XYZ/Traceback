@@ -48,6 +48,9 @@ curl -s "http://localhost:8080/api/services/player-manager/environments/staging/
 curl -X POST http://localhost:8080/api/admin/ingest/fixtures
 
 curl -s http://localhost:8080/healthz
+# Liveness (process only) and readiness (PostgreSQL dependency):
+curl -s http://localhost:8080/healthz/live
+curl -s http://localhost:8080/healthz/ready
 ```
 
 OpenAPI document (development): `http://localhost:8080/openapi/v1.json`.
@@ -160,15 +163,21 @@ dotnet ef migrations add <Name> \
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `ConnectionStrings__Default` | localhost compose values | PostgreSQL connection |
-| `MigrateOnStartup` | `true` | apply EF migrations at boot |
+| `ConnectionStrings__Default` | local fallback in Development; required otherwise | PostgreSQL connection |
+| `MigrateOnStartup` | `true` in Development; `false` otherwise | apply EF migrations at boot |
 | `IngestFixturesOnStartup` | `false` (`true` in compose) | seed the fixture scenario via the ingestion boundary |
 | `GitHub__Token` | unset | read-only GitHub token (user secrets / environment) |
 | `GitHub__TokenFile` | unset | alternative: path to a mounted secret file |
+| `GitHub__ApiBaseUrl` | `https://api.github.com/` | GitHub or GitHub Enterprise API base; trailing `/` is normalized so paths such as `/api/v3` are preserved |
 | `GitHub__Repositories__0__Owner` / `__Name` | unset | the repository to synchronize |
 | `GitHub__InitialLookbackDays` | `30` | history depth of a repository's first sync |
 | `GitHub__IncrementalOverlapDays` | `7` | how far behind each watermark later passes re-inspect |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | enables OTLP trace/metric export |
+
+`/healthz/live` reports process liveness without contacting PostgreSQL.
+`/healthz/ready` reports PostgreSQL readiness and returns HTTP 503 when the
+database is unavailable. `/healthz` remains an alias for readiness. Health
+responses expose status only and never include connection details.
 
 Every GitHub setting is listed in
 [docs/integrations/github.md](docs/integrations/github.md#configuration).

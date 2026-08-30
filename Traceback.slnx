@@ -13,5 +13,6 @@
     <Project Path="tests/Traceback.Tests.GitHub/Traceback.Tests.GitHub.csproj" />
     <Project Path="tests/Traceback.Tests.GitHubSupport/Traceback.Tests.GitHubSupport.csproj" />
     <Project Path="tests/Traceback.Tests.Integration/Traceback.Tests.Integration.csproj" />
+    <Project Path="tests/Traceback.Benchmark/Traceback.Benchmark.csproj" />
   </Folder>
 </Solution>

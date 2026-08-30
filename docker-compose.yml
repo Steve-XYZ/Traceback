@@ -1,12 +1,12 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     environment:
       POSTGRES_DB: traceback
       POSTGRES_USER: traceback
       POSTGRES_PASSWORD: traceback
     ports:
-      - "54329:5432"
+      - "127.0.0.1:54329:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -30,8 +30,8 @@ services:
       # to run without the connector - synchronization then fails fast with a
       # configuration error instead of starting up broken.
       GitHub__Token: ${GITHUB_TOKEN:-}
-      GitHub__Repositories__0__Owner: ${GITHUB_OWNER:-}
-      GitHub__Repositories__0__Name: ${GITHUB_REPO:-}
+      GITHUB_OWNER: ${GITHUB_OWNER:-}
+      GITHUB_REPO: ${GITHUB_REPO:-}
       GitHub__InitialLookbackDays: ${GITHUB_INITIAL_LOOKBACK_DAYS:-30}
       # Set OTEL_EXPORTER_OTLP_ENDPOINT to enable OTLP export, e.g. to an
       # otel-collector + Grafana stack. Off by default.
