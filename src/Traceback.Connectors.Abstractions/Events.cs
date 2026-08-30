@@ -117,7 +117,10 @@ public sealed record DeploymentObserved(
     DeploymentOutcome? Outcome,
     DateTimeOffset DeployedAt,
     // Run that produced the artifact, when the deployer knows it.
-    ExternalRef? TriggeredByWorkflowRun) : TracebackEvent(Provenance);
+    ExternalRef? TriggeredByWorkflowRun) : TracebackEvent(Provenance), IStateFreshness
+{
+    DateTimeOffset? IStateFreshness.StateUpdatedAt => Provenance.OccurredAt;
+}
 
 // Deployment outcome as stated by the source. Unknown maps to domain Unknown.
 public sealed record DeploymentOutcome(string RawStatus)

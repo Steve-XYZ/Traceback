@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using Traceback.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using Traceback.Infrastructure.Persistence;
 namespace Traceback.Infrastructure.Persistence.Migrations
 {
     [DbContext(typeof(TracebackDbContext))]
-    partial class TracebackDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260830141257_DeploymentLifecycleFreshness")]
+    partial class DeploymentLifecycleFreshness
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -1021,10 +1024,6 @@ namespace Traceback.Infrastructure.Persistence.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Sequence"));
 
-                    b.Property<Guid?>("DeploymentId")
-                        .HasColumnType("uuid")
-                        .HasColumnName("deployment_id");
-
                     b.Property<string>("EntityTypeName")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -1070,9 +1069,6 @@ namespace Traceback.Infrastructure.Persistence.Migrations
 
                     b.HasKey("Sequence")
                         .HasName("pk_observations");
-
-                    b.HasIndex("DeploymentId")
-                        .HasDatabaseName("ix_observations_deployment_id");
 
                     b.HasIndex("Fingerprint")
                         .IsUnique()
@@ -1415,17 +1411,6 @@ namespace Traceback.Infrastructure.Persistence.Migrations
                     b.Navigation("WorkItem");
 
                     b.Navigation("WorkflowRun");
-                });
-
-            modelBuilder.Entity("Traceback.Infrastructure.Persistence.Observation", b =>
-                {
-                    b.HasOne("Traceback.Domain.Entities.Deployment", "Deployment")
-                        .WithMany()
-                        .HasForeignKey("DeploymentId")
-                        .OnDelete(DeleteBehavior.SetNull)
-                        .HasConstraintName("fk_observations_deployments_deployment_id");
-
-                    b.Navigation("Deployment");
                 });
 
             modelBuilder.Entity("Traceback.Domain.Entities.BuildArtifact", b =>

@@ -87,6 +87,14 @@ public sealed class Observation
     /// <summary>Ingestion sequence (monotonic, database-assigned).</summary>
     public long Sequence { get; set; }
 
+    /// <summary>
+    /// Natural deployment resolved from this deployment observation. The
+    /// provider external key is intentionally retained on the observation
+    /// because a provider may reuse that key for more than one rollout.
+    /// </summary>
+    public Guid? DeploymentId { get; set; }
+    public Deployment? Deployment { get; set; }
+
     public required string Provider { get; init; }
 
     /// <summary>e.g. "WorkItemObserved".</summary>
