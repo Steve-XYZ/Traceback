@@ -221,13 +221,22 @@ internal static class ResultMappers
 
     private static List<SourceEvidence> DeploymentSources(Guid deploymentId, EvidenceLoadResult evd)
     {
-        // New observations retain the provider's raw key and are authoritative
-        // for API evidence. Synthetic ExternalIdentity keys remain a fallback
-        // for deployments created before the observation link was introduced.
-        if (evd.DeploymentObservations.TryGetValue(deploymentId, out var observations)
-            && observations.Count > 0)
-            return observations;
-        return Sources(deploymentId, null, evd.Deployments);
+        var observations = evd.DeploymentObservations.TryGetValue(deploymentId, out var linked)
+            ? linked
+            : [];
+        var fallback = Sources(deploymentId, null, evd.Deployments);
+
+        // Dedupe only exact (Provider, ExternalKey) pairs with ordinal string
+        // equality. Linked raw evidence is first, so it wins if an identical
+        // fallback identity is also present; distinct synthetic keys remain
+        // visible so legacy evidence is not dropped when another provider links.
+        var seen = new HashSet<(string Provider, string ExternalKey)>();
+        return observations
+            .Concat(fallback)
+            .Where(source => seen.Add((source.Provider, source.ExternalKey)))
+            .OrderBy(source => source.Provider, StringComparer.Ordinal)
+            .ThenBy(source => source.ExternalKey, StringComparer.Ordinal)
+            .ToList();
     }
 
     private static List<SourceEvidence> Sources(

@@ -33,9 +33,11 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         Assert.Equal(2, history.GetProperty("deployments").GetArrayLength());
         foreach (var entry in history.GetProperty("deployments").EnumerateArray())
         {
-            var source = Assert.Single(entry.GetProperty("deployment").GetProperty("sources").EnumerateArray());
-            Assert.Equal("docker", source.GetProperty("provider").GetString());
-            Assert.Equal("checkout/staging", source.GetProperty("externalKey").GetString());
+            Assert.Contains(entry.GetProperty("deployment").GetProperty("sources").EnumerateArray(), source =>
+            {
+                return source.GetProperty("provider").GetString() == "docker"
+                    && source.GetProperty("externalKey").GetString() == "checkout/staging";
+            });
         }
     }
 
@@ -132,6 +134,41 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         Assert.Equal(2, await CountDeploymentIdentitiesAsync(app));
         Assert.Contains("docker/checkout/docker-rollout-1", sources);
         Assert.Contains("argocd/checkout/argocd-rollout-7", sources);
+    }
+
+    [Fact]
+    public async Task A_new_linked_provider_observation_does_not_hide_legacy_deployment_evidence()
+    {
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+        var deployedAt = new DateTimeOffset(2026, 08, 20, 12, 30, 00, TimeSpan.Zero);
+
+        await app.IngestAsync([Deployment("docker", "checkout/legacy-rollout", Artifact, DeploymentOutcome.Succeeded,
+            deployedAt, deployedAt, deployedAt.AddMinutes(1))]);
+        // Simulate a deployment observation written before the evidence link
+        // migration. Its synthetic ExternalIdentity remains durable fallback evidence.
+        await ExecuteAsync(app, "UPDATE observations SET deployment_id = NULL WHERE entity_type_name = 'deployment' AND external_key = 'checkout/legacy-rollout'");
+
+        await app.IngestAsync([Deployment("argocd", "checkout/new-provider-rollout", Artifact, DeploymentOutcome.Succeeded,
+            deployedAt, deployedAt.AddSeconds(10), deployedAt.AddMinutes(2))]);
+
+        var current = await app.Client.GetJsonAsync(
+            "/api/services/checkout/environments/staging/current-deployment");
+        var sources = current.GetProperty("current").GetProperty("deployment").GetProperty("sources")
+            .EnumerateArray()
+            .Select(source =>
+                (Provider: source.GetProperty("provider").GetString()!,
+                    ExternalKey: source.GetProperty("externalKey").GetString()!))
+            .ToList();
+
+        Assert.Equal(sources.Count, sources.Distinct().Count());
+        Assert.Equal(
+            sources.OrderBy(source => source.Provider, StringComparer.Ordinal)
+                .ThenBy(source => source.ExternalKey, StringComparer.Ordinal),
+            sources);
+        Assert.Contains(sources, source => source.Provider == "docker"
+            && source.ExternalKey.StartsWith("deployments/", StringComparison.Ordinal));
+        Assert.Contains(sources, source => source.Provider == "argocd"
+            && source.ExternalKey == "checkout/new-provider-rollout");
     }
 
     [Fact]
