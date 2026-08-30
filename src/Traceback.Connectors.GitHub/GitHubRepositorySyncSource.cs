@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Traceback.Connectors.Abstractions;
@@ -28,8 +29,9 @@ namespace Traceback.Connectors.GitHub;
 ///   run_attempt without moving created_at. The stream therefore re-inspects
 ///   created >= watermark minus overlap AND enumerates all attempts of any run
 ///   whose run_attempt exceeds 1, so reruns are never reduced to their latest
-///   attempt. Artifacts are fetched per run and attached to that run's highest
-///   observed attempt (GitHub scopes artifacts to runs, not attempts).
+///   attempt. Artifacts come from whichever GitHub listing is cheaper for the
+///   pass (see FetchArtifactsAsync) and attach to that run's highest observed
+///   attempt, because GitHub scopes artifacts to runs, not attempts.
 ///
 /// A pass never advances past truncated data: if the page cap is hit before a
 /// stream finishes walking its window, the previous watermark is returned
@@ -39,10 +41,25 @@ internal sealed class GitHubRepositorySyncSource(
     IGitHubApiClient api,
     GitHubRepositorySyncSource.IOptionsMonitorHolder options) : IRepositorySyncSource
 {
+    /// <summary>
+    /// Shared with the synchronizer so connector fetch/normalize spans nest
+    /// under the same <c>github.sync</c> trace.
+    /// </summary>
+    internal static readonly ActivitySource Activity = new("Traceback.Sync");
+
     public string Provider => "github";
 
     public IReadOnlyList<string> OrderedResourceTypes { get; } =
         ["repository", "pull_requests", "commits", "workflow_runs"];
+
+    /// <summary>Span covering DTO-to-event translation only; fetching happens outside it.</summary>
+    private static Activity? StartNormalize(string resourceType, int inputCount)
+    {
+        var span = Activity.StartActivity("traceback.normalize");
+        span?.SetTag("traceback.normalize.resource", resourceType);
+        span?.SetTag("traceback.normalize.inputs", inputCount);
+        return span;
+    }
 
     internal interface IOptionsMonitorHolder
     {
@@ -79,6 +96,7 @@ internal sealed class GitHubRepositorySyncSource(
     private async Task<ResourceFetchResult> FetchRepositoryAsync(string owner, string name, GitHubEventMapper mapper, CancellationToken ct)
     {
         var repo = await api.GetRepositoryAsync(owner, name, ct);
+        using var normalize = StartNormalize("repository", 1);
         return new ResourceFetchResult([mapper.MapRepository(repo)], NextCursor: "initialized") { InspectedCount = 1 };
     }
 
@@ -147,27 +165,36 @@ internal sealed class GitHubRepositorySyncSource(
         string owner, string name, GitHubApiPullRequest pr, GitHubEventMapper mapper, CancellationToken ct)
     {
         var pageSize = options.Current.PageSize;
-        var shas = new List<string>();
-        List<TracebackEvent>? commitEvents = null;
+        var members = new List<GitHubApiCommit>();
 
-        string? nextUrl = null;
-        while (true)
+        using (var fetchSpan = Activity.StartActivity("github.fetch.pull_request_commits"))
         {
-            var page = await api.GetPullRequestCommitsPageAsync(owner, name, pr.Number, nextUrl, pageSize, notFoundAsEmpty: true, cancellationToken: ct);
-            if (page is not { } current || current.Items.Count == 0)
-                break;
-            foreach (var commit in current.Items)
+            fetchSpan?.SetTag("traceback.github.pull_request", pr.Number);
+            string? nextUrl = null;
+            while (true)
             {
-                var evt = mapper.MapCommit(commit);
-                shas.Add(evt.Sha);
-                (commitEvents ??= []).Add(evt);
+                var page = await api.GetPullRequestCommitsPageAsync(owner, name, pr.Number, nextUrl, pageSize, notFoundAsEmpty: true, cancellationToken: ct);
+                if (page is not { } current || current.Items.Count == 0)
+                    break;
+                members.AddRange(current.Items);
+                if (!current.HasNext)
+                    break;
+                nextUrl = current.NextUrl;
             }
-            if (!current.HasNext)
-                break;
-            nextUrl = current.NextUrl;
+            fetchSpan?.SetTag("traceback.github.commits", members.Count);
         }
 
-        return [.. commitEvents ?? [], mapper.MapPullRequest(pr, shas)];
+        using var normalize = StartNormalize("pull_requests", members.Count + 1);
+        var shas = new List<string>(members.Count);
+        var events = new List<TracebackEvent>(members.Count + 1);
+        foreach (var commit in members)
+        {
+            var evt = mapper.MapCommit(commit);
+            shas.Add(evt.Sha);
+            events.Add(evt);
+        }
+        events.Add(mapper.MapPullRequest(pr, shas));
+        return events;
     }
 
     private async Task<ResourceFetchResult> FetchCommitsAsync(
@@ -193,13 +220,16 @@ internal sealed class GitHubRepositorySyncSource(
             if (page.Items.Count == 0)
                 break;
 
-            foreach (var commit in page.Items)
+            using (StartNormalize("commits", page.Items.Count))
             {
-                inspected++;
-                var when = commit.Details?.Committer?.Date ?? commit.Details?.Author?.Date ?? DateTimeOffset.MinValue;
-                if (when > newestSeen)
-                    newestSeen = when;
-                events.Add(mapper.MapCommit(commit));
+                foreach (var commit in page.Items)
+                {
+                    inspected++;
+                    var when = commit.Details?.Committer?.Date ?? commit.Details?.Author?.Date ?? DateTimeOffset.MinValue;
+                    if (when > newestSeen)
+                        newestSeen = when;
+                    events.Add(mapper.MapCommit(commit));
+                }
             }
 
             if (!page.HasNext)
@@ -228,10 +258,13 @@ internal sealed class GitHubRepositorySyncSource(
             ?? request.Now.AddDays(-request.InitialLookbackDays);
         var effectiveFrom = createdFrom - TimeSpan.FromDays(opts.IncrementalOverlapDays);
 
-        var events = new List<TracebackEvent>();
         var inspected = 0;
         var newestSeen = createdFrom;
         var truncated = false;
+
+        // Collect the attempts first and emit afterwards: knowing how many runs
+        // the pass covers is what lets the artifact fetch pick a strategy.
+        var runs = new List<(long RunId, List<GitHubApiWorkflowRun> Attempts)>();
 
         string? nextUrl = null;
         var pagesWalked = 0;
@@ -251,22 +284,23 @@ internal sealed class GitHubRepositorySyncSource(
                     newestSeen = createdAt;
 
                 // Reruns: enumerate every attempt so no attempt's history is
-                // rewritten or lost; single-attempt runs emit directly.
-                IReadOnlyList<GitHubApiWorkflowRun> attemptRuns = run.RunAttempt > 1
-                    ? await api.GetRunAttemptsAsync(owner, name, run.Id, notFoundAsEmpty: true, cancellationToken: ct) ?? []
-                    : [run];
-
-                var artifacts = await api.GetRunArtifactsAsync(owner, name, run.Id, notFoundAsEmpty: true, cancellationToken: ct);
-                var descriptors = artifacts.Select(mapper.MapArtifact).ToList();
-
-                // Artifacts belong to the run as a whole; attach them to the
-                // highest attempt observed in this pass (deterministic rule).
-                var orderedAttempts = attemptRuns.OrderBy(a => Math.Max(1, a.RunAttempt)).ToList();
-                for (var i = 0; i < orderedAttempts.Count; i++)
+                // rewritten or lost; single-attempt runs need no extra request.
+                IReadOnlyList<GitHubApiWorkflowRun> attempts;
+                if (run.RunAttempt > 1)
                 {
-                    var isHighest = i == orderedAttempts.Count - 1;
-                    events.Add(mapper.MapWorkflowRun(orderedAttempts[i], isHighest ? descriptors : []));
+                    using var attemptsSpan = Activity.StartActivity("github.fetch.run_attempts");
+                    attemptsSpan?.SetTag("traceback.github.run_id", run.Id);
+                    attempts = await api.GetRunAttemptsAsync(owner, name, run.Id, notFoundAsEmpty: true, cancellationToken: ct);
+                    attemptsSpan?.SetTag("traceback.github.attempts", attempts.Count);
+                    if (attempts.Count == 0)
+                        attempts = [run];
                 }
+                else
+                {
+                    attempts = [run];
+                }
+
+                runs.Add((run.Id, attempts.OrderBy(a => Math.Max(1, a.RunAttempt)).ToList()));
             }
 
             if (!page.HasNext)
@@ -279,12 +313,101 @@ internal sealed class GitHubRepositorySyncSource(
             nextUrl = page.NextUrl;
         }
 
+        var artifactsByRun = await FetchArtifactsAsync(owner, name, runs.ConvertAll(r => r.RunId), ct);
+
+        var events = new List<TracebackEvent>(runs.Sum(r => r.Attempts.Count));
+        using (StartNormalize("workflow_runs", runs.Count))
+        {
+            foreach (var (runId, attempts) in runs)
+            {
+                var descriptors = artifactsByRun.TryGetValue(runId, out var found)
+                    ? found.ConvertAll(mapper.MapArtifact)
+                    : [];
+
+                // Artifacts belong to the run as a whole; attach them to the
+                // highest attempt observed in this pass (deterministic rule).
+                for (var i = 0; i < attempts.Count; i++)
+                {
+                    var isHighest = i == attempts.Count - 1;
+                    events.Add(mapper.MapWorkflowRun(attempts[i], isHighest ? descriptors : []));
+                }
+            }
+        }
+
         DateTimeOffset? next;
         if (truncated)
             next = createdFrom;
         else
             next = newestSeen > createdFrom ? newestSeen : createdFrom == DateTimeOffset.MinValue ? null : createdFrom;
         return new ResourceFetchResult(events, RunsCursor.Write(next)) { InspectedCount = inspected };
+    }
+
+    /// <summary>
+    /// Artifacts for every run in this pass. GitHub exposes them two ways and
+    /// which is cheaper depends on the shape of the pass: one request per run,
+    /// or a repository-wide listing paged 100 at a time. A single probe request
+    /// reports the repository's artifact total, which is enough to choose.
+    ///
+    /// It matters: a 90-day first sync of 3000 runs costs 3000 requests the
+    /// per-run way and a handful the repository way, and GitHub allows 5000
+    /// requests an hour. A small overlap window is the opposite case, so the
+    /// per-run path stays.
+    /// </summary>
+    private async Task<Dictionary<long, List<GitHubApiArtifact>>> FetchArtifactsAsync(
+        string owner, string name, List<long> runIds, CancellationToken ct)
+    {
+        var byRun = new Dictionary<long, List<GitHubApiArtifact>>();
+        if (runIds.Count == 0)
+            return byRun;
+
+        var opts = options.Current;
+        using var span = Activity.StartActivity("github.fetch.artifacts");
+        span?.SetTag("traceback.github.runs", runIds.Count);
+
+        // A single run can never be beaten by a repository-wide walk, so do not
+        // spend the probe request on it.
+        if (runIds.Count > 1)
+        {
+            var probe = await api.GetRepositoryArtifactsPageAsync(owner, name, null, opts.PageSize, notFoundAsEmpty: true, cancellationToken: ct);
+            var pagesNeeded = probe.TotalCount <= 0 ? 1 : (probe.TotalCount + opts.PageSize - 1) / opts.PageSize;
+            if (pagesNeeded <= Math.Min(runIds.Count, opts.MaxPagesPerFetch))
+            {
+                span?.SetTag("traceback.github.artifact_strategy", "repository");
+                var wanted = runIds.ToHashSet();
+                var page = probe;
+                var walked = 1;
+                while (true)
+                {
+                    foreach (var artifact in page.Items)
+                    {
+                        // Artifacts of runs outside this pass are ignored; their
+                        // runs are not being emitted, so there is nothing to
+                        // attach them to.
+                        if (artifact.WorkflowRun?.Id is not { } id || !wanted.Contains(id))
+                            continue;
+                        if (!byRun.TryGetValue(id, out var list))
+                            byRun[id] = list = [];
+                        list.Add(artifact);
+                    }
+                    if (!page.HasNext || walked >= opts.MaxPagesPerFetch)
+                        break;
+                    page = await api.GetRepositoryArtifactsPageAsync(owner, name, page.NextUrl, opts.PageSize, notFoundAsEmpty: true, cancellationToken: ct);
+                    walked++;
+                }
+                span?.SetTag("traceback.github.artifact_requests", walked);
+                return byRun;
+            }
+        }
+
+        span?.SetTag("traceback.github.artifact_strategy", "per_run");
+        foreach (var runId in runIds)
+        {
+            var artifacts = await api.GetRunArtifactsAsync(owner, name, runId, notFoundAsEmpty: true, cancellationToken: ct);
+            if (artifacts.Count > 0)
+                byRun[runId] = [.. artifacts];
+        }
+        span?.SetTag("traceback.github.artifact_requests", runIds.Count);
+        return byRun;
     }
 }
 

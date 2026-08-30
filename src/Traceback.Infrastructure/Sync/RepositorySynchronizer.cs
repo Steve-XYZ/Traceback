@@ -132,6 +132,13 @@ public sealed partial class RepositorySynchronizer(
             fetchSpan?.SetTag("traceback.sync.inspected", fetch.InspectedCount);
             fetchSpan?.SetTag("traceback.sync.applied", ingest.Applied);
 
+            var cursor = state.Cursor;
+
+            // Each stream starts from a clean tracker: the previous stream's
+            // committed graph is of no use to the next one and only slows
+            // change detection down as the pass grows.
+            db.ChangeTracker.Clear();
+
             return new ResourceSyncOutcome(
                 resourceType,
                 fetch.InspectedCount,
@@ -139,7 +146,7 @@ public sealed partial class RepositorySynchronizer(
                 ingest.Applied,
                 ingest.Duplicated,
                 resourceStopwatch.Elapsed.TotalMilliseconds,
-                state.Cursor,
+                cursor,
                 advanced);
         }
         catch (OperationCanceledException)
@@ -149,20 +156,52 @@ public sealed partial class RepositorySynchronizer(
         catch (Exception ex)
         {
             resourceStopwatch.Stop();
-            state.LastError = SanitizeError(ex);
-            state.UpdatedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync(ct);
-            return new ResourceSyncOutcome(
-                resourceType,
-                Inspected: 0,
-                ObservationsReceived: 0,
-                ObservationsApplied: 0,
-                Duplicated: 0,
-                DurationMs: resourceStopwatch.Elapsed.TotalMilliseconds,
-                Cursor: state.Cursor,
-                CursorAdvanced: false,
-                Error: SanitizeError(ex));
+            return await RecordFailureAsync(integrationId, resourceType, resourceStopwatch, ex, ct);
         }
+    }
+
+    /// <summary>
+    /// Records a stream failure without letting the failed batch reach the
+    /// database. A rolled-back ingestion leaves its entities in the change
+    /// tracker, so writing the checkpoint row on the same context would flush
+    /// them - untransacted, and without the observations that justify them.
+    /// The tracker is dropped first and the checkpoint reloaded.
+    /// </summary>
+    private async Task<ResourceSyncOutcome> RecordFailureAsync(
+        string integrationId, string resourceType, Stopwatch resourceStopwatch, Exception ex, CancellationToken ct)
+    {
+        db.ChangeTracker.Clear();
+
+        var state = await db.SyncStates.FindAsync([integrationId, resourceType], ct);
+        if (state is null)
+        {
+            state = new SyncState
+            {
+                IntegrationId = integrationId,
+                ResourceType = resourceType,
+                LastAttemptAt = DateTimeOffset.UtcNow,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            await db.SyncStates.AddAsync(state, ct);
+        }
+
+        state.LastError = SanitizeError(ex);
+        state.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+
+        var cursor = state.Cursor;
+        db.ChangeTracker.Clear();
+
+        return new ResourceSyncOutcome(
+            resourceType,
+            Inspected: 0,
+            ObservationsReceived: 0,
+            ObservationsApplied: 0,
+            Duplicated: 0,
+            DurationMs: resourceStopwatch.Elapsed.TotalMilliseconds,
+            Cursor: cursor,
+            CursorAdvanced: false,
+            Error: SanitizeError(ex));
     }
 
     /// <summary>Single-line, message-only error text: exception data may carry provider payloads, so it is dropped.</summary>

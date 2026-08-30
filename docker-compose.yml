@@ -25,10 +25,20 @@ services:
       ConnectionStrings__Default: Host=postgres;Port=5432;Database=traceback;Username=traceback;Password=traceback
       MigrateOnStartup: "true"
       IngestFixturesOnStartup: "true"
+      # Read-only GitHub connector. Values come from .env (git-ignored); see
+      # .env.example and docs/integrations/github.md. Leave GITHUB_TOKEN empty
+      # to run without the connector - synchronization then fails fast with a
+      # configuration error instead of starting up broken.
+      GitHub__Token: ${GITHUB_TOKEN:-}
+      GitHub__Repositories__0__Owner: ${GITHUB_OWNER:-}
+      GitHub__Repositories__0__Name: ${GITHUB_REPO:-}
+      GitHub__InitialLookbackDays: ${GITHUB_INITIAL_LOOKBACK_DAYS:-30}
       # Set OTEL_EXPORTER_OTLP_ENDPOINT to enable OTLP export, e.g. to an
       # otel-collector + Grafana stack. Off by default.
     ports:
-      - "8080:8080"
+      # Loopback only: the API has no authentication yet, so it must not be
+      # reachable from the network. See the security section of the README.
+      - "127.0.0.1:8080:8080"
 
 volumes:
   postgres-data:

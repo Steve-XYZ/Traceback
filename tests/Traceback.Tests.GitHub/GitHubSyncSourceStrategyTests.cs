@@ -206,6 +206,69 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
     private static ResourceFetchRequest Fetch(string resourceType, string? cursor) =>
         new("acme/player-manager", resourceType, cursor, InitialLookbackDays: 30, Now);
 
+    [Fact]
+    public async Task Artifacts_come_from_the_repository_listing_when_that_costs_fewer_requests()
+    {
+        // Six runs, one artifact each: the repository-wide listing needs
+        // ceil(6/2) = 3 pages against 6 per-run requests, so it wins.
+        for (var i = 1; i <= 6; i++)
+        {
+            World.AddRun(
+                new FakeRun
+                {
+                    Id = 500 + i,
+                    HeadSha = $"sha{i:d4}".PadRight(40, 'a'),
+                    CreatedAt = Now.AddHours(-i),
+                    RunStartedAt = Now.AddHours(-i),
+                    UpdatedAt = Now.AddHours(-i),
+                },
+                [new FakeArtifact { Id = 700 + i, Name = $"drop-{i}" }]);
+        }
+
+        var result = await _source.FetchAsync(Fetch("workflow_runs", cursor: null));
+
+        var runEvents = result.Events.OfType<WorkflowRunObserved>().ToList();
+        Assert.Equal(6, runEvents.Count);
+        Assert.All(runEvents, e => Assert.Single(e.ProducedArtifacts));
+        Assert.Equal(
+            ["drop-1", "drop-2", "drop-3", "drop-4", "drop-5", "drop-6"],
+            runEvents.SelectMany(e => e.ProducedArtifacts).Select(a => a.Name).Order().ToList());
+
+        // The repository-wide listing was walked; no per-run artifact request.
+        Assert.Contains(_handler.RequestLog, r => r.Contains("/actions/artifacts", StringComparison.Ordinal));
+        Assert.DoesNotContain(_handler.RequestLog, r => r.Contains("/runs/501/artifacts", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Artifacts_fall_back_to_per_run_requests_when_the_repository_listing_is_larger()
+    {
+        // Two runs in the window but ten artifacts in the repository: the
+        // repository listing would need five pages, so per-run wins.
+        for (var i = 1; i <= 2; i++)
+        {
+            World.AddRun(
+                new FakeRun
+                {
+                    Id = 600 + i,
+                    HeadSha = $"sha{i:d4}".PadRight(40, 'c'),
+                    CreatedAt = Now.AddHours(-i),
+                    RunStartedAt = Now.AddHours(-i),
+                    UpdatedAt = Now.AddHours(-i),
+                },
+                [new FakeArtifact { Id = 800 + i, Name = $"drop-{i}" }]);
+        }
+        // Artifacts belonging to runs outside the window inflate the listing.
+        World.Artifacts[999] = [.. Enumerable.Range(1, 8).Select(i => new FakeArtifact { Id = 900 + i, Name = $"old-{i}" })];
+
+        var result = await _source.FetchAsync(Fetch("workflow_runs", cursor: null));
+
+        var runEvents = result.Events.OfType<WorkflowRunObserved>().ToList();
+        Assert.Equal(2, runEvents.Count);
+        Assert.All(runEvents, e => Assert.Single(e.ProducedArtifacts));
+        Assert.Contains(_handler.RequestLog, r => r.Contains("/runs/601/artifacts", StringComparison.Ordinal));
+        Assert.Contains(_handler.RequestLog, r => r.Contains("/runs/602/artifacts", StringComparison.Ordinal));
+    }
+
     private void AddPullRequest(int number, int? daysAgo = null, int? hoursAgo = null)
     {
         var updatedAt = Now - (daysAgo is not null ? TimeSpan.FromDays(daysAgo.Value) : TimeSpan.FromHours(hoursAgo!.Value));

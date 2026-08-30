@@ -1,22 +1,46 @@
 # Traceback Roadmap
 
 The foundation milestone (canonical model, ingestion boundary, persistence,
-fixture vertical slice) is complete. The milestones below build on it in the
-order that maximizes real-data learning: live connectors first, correlation on
-top of their data, investigation last.
+fixture vertical slice) and the GitHub connector are complete. The milestones
+below build on them in the order that maximizes real-data learning: live
+connectors first, correlation on top of their data, investigation last.
 
-## 1. GitHub + GitHub Actions connector
+## 1. GitHub + GitHub Actions connector — done
 
-First live connectors, chosen together because one PR/commit chain spans both.
+Read-only synchronization of one or more GitHub repositories.
 
-- webhook receivers + REST polling for pull requests and commits;
-- workflow runs with head SHA linkage and produced image digests;
-- raw webhook payload archiving (first consumer of the deferred evidence sink);
-- conflict retry for concurrent identical deliveries;
-- rate-limit/backoff strategy and connector scheduling infrastructure
-  (hosted pollers, per-connector state cursors).
+Delivered:
 
-Exit: a merged PR's commit → run → artifact chain reconstructs from live data.
+- repository-scoped identity (`SourceRepository`): PR numbers, run ids and
+  commit SHAs are only unique inside a repository, and the schema now says so;
+- pull requests with lifecycle timestamps, merge facts, head/base branches and
+  authors; commit membership taken from GitHub's own PR commit listing;
+- commits with author/committer identity, message and canonical URL;
+- Actions runs keyed by `(repository, run id, attempt)`, so a rerun adds an
+  attempt instead of rewriting the previous one;
+- Actions artifacts as `BuildArtifact` rows linked to the run that produced them;
+- incremental synchronization with per-stream checkpoints in `sync_states`,
+  a deliberate overlap window, and checkpoint advance only after durable
+  ingestion;
+- provider-state freshness gating, so a late delivery of an older representation
+  cannot revert newer state;
+- bounded retries, deliberate rate-limit handling, sanitized errors, secrets
+  kept out of logs, traces, exceptions and API responses;
+- deterministic read APIs: pull request context, commit delivery context, and a
+  paginated repository change timeline, each carrying its evidence;
+- OpenTelemetry spans and metrics for the whole sync path, and a repeatable
+  performance benchmark (see [performance.md](performance.md)).
+
+Explicitly **not** delivered, and not implied by anything above:
+
+- no link from a workflow run to a container image. GitHub Actions exposes no
+  REST evidence for it, so the deployment relationship stays unresolved rather
+  than guessed;
+- no webhooks or background scheduling. Synchronization is pull-based and
+  triggered explicitly;
+- no issues, reviews, checks, statuses, releases, branches or deployments;
+- no application-level authorization on the API (see the security section of the
+  README).
 
 ## 2. Linear connector
 
@@ -32,7 +56,10 @@ Exit: "what code implements this ticket?" answers from live tickets.
 - registry events / CD webhooks mapping to `DeploymentObserved`;
 - container runtime facts mapping to `ServiceInstanceObserved`
   (the model already supports instances; no producer exists yet);
-- artifact digest-first identity exercised by real registries.
+- artifact digest-first identity exercised by real registries;
+- **this is the milestone that closes the workflow-run → image gap** left open by
+  milestone 1: a registry that reports which run pushed which digest supplies
+  the evidence GitHub does not.
 
 Exit: "is this ticket deployed?" and "what version is running?" answer from the
 real deployment path.
@@ -44,6 +71,7 @@ real deployment path.
   observation log);
 - cross-provider gap detection (ticket deployed but never merged, artifact
   running without a known build);
+- extend the repository change timeline from milestone 1 across providers;
 - revisit whether any generic relation abstraction has earned existence by now.
 
 Exit: deterministic engineering timelines without LLMs.
@@ -81,9 +109,26 @@ from.
   documents with provenance;
 - investigator consumes docs as context alongside timelines.
 
+## Cross-cutting work these milestones will force
+
+- **Authorization.** The API is unauthenticated and bound to loopback in
+  development. A shared deployment needs authentication and per-repository
+  authorization before anything else on this list ships to more than one machine.
+- **Background scheduling.** Manual synchronization is enough for one repository;
+  several repositories on a cadence need a scheduler with per-integration
+  concurrency limits and rate-limit awareness.
+- **Multi-writer ingestion.** Concurrent identical deliveries currently surface
+  as unique-constraint violations. A conflict-retry path is straightforward but
+  unnecessary while a single process triggers synchronization.
+- **Tombstones.** Deleted pull requests, expired artifacts and pruned runs have
+  no representation; edges are additive until a provider produces removal
+  signals.
+
 ## Standing principles for every milestone
 
 - new providers enter only through `Traceback.Connectors.Abstractions` events;
 - ingestion stays idempotent, order-independent, and fully evidenced;
 - questions are answered deterministically first; AI assists after facts exist;
+- unknown beats plausible: a relationship without provider evidence stays
+  unresolved rather than inferred;
 - no new infrastructure without a concrete requirement.

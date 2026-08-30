@@ -174,9 +174,26 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
             var body = JsonSerializer.Serialize(new
             {
                 total_count = artifacts.Count,
-                artifacts = artifacts.Select(ArtifactJson).ToList(),
+                artifacts = artifacts.Select(a => ArtifactJson(a, runId: null)).ToList(),
             });
             return Response(200, body);
+        }
+
+        // GET /repos/{o}/{r}/actions/artifacts (repository-wide; each artifact names its run)
+        if (segments is ["repos", _, _, "actions", "artifacts"])
+        {
+            var all = WorldFor(segments)!.Artifacts
+                .SelectMany(pair => pair.Value.Select(a => (RunId: pair.Key, Artifact: a)))
+                .OrderByDescending(x => x.Artifact.Id)
+                .ToList();
+            var pageItems = all.Skip((page - 1) * perPage).Take(perPage).ToList();
+            var hasNext = page * perPage < all.Count;
+            var body = JsonSerializer.Serialize(new
+            {
+                total_count = all.Count,
+                artifacts = pageItems.Select(x => ArtifactJson(x.Artifact, x.RunId)).ToList(),
+            });
+            return Response(200, body, HeadersFor(fullPathAndQuery, hasNext, page, perPage));
         }
 
         return Response(404, """{"message":"Not Found"}""");
@@ -257,7 +274,12 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
         html_url = $"https://github.com/fake/actions/runs/{r.Id}/attempts/{r.RunAttempt}",
     };
 
-    private static object ArtifactJson(FakeArtifact a) => new
+    /// <summary>
+    /// The per-run listing omits workflow_run (the URL implies it); the
+    /// repository-wide listing includes it. The fake mirrors that difference so
+    /// the connector cannot accidentally depend on the wrong one.
+    /// </summary>
+    private static object ArtifactJson(FakeArtifact a, long? runId) => new
     {
         id = a.Id,
         name = a.Name,
@@ -266,6 +288,7 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
         expired = a.Expired,
         created_at = a.CreatedAt?.ToString("O"),
         updated_at = a.UpdatedAt?.ToString("O"),
+        workflow_run = runId is null ? null : new { id = runId.Value },
     };
 
     private static HttpResponseMessage Response(int status, string body, Dictionary<string, string>? headers = null)

@@ -69,7 +69,9 @@ internal sealed partial class GitHubRestClient(
     {
         var path = nextPageUrl ?? $"repos/{owner}/{name}/actions/runs?per_page={pageSize}" + FormatCreated(createdFrom);
         var page = await GetObjectPageAsync<GitHubApiWorkflowRunsPage>(path, cancellationToken);
-        return new GitHubArrayPage<GitHubApiWorkflowRun>(page.Payload.WorkflowRuns ?? [], page.NextUrl);
+        return page is null
+            ? new GitHubArrayPage<GitHubApiWorkflowRun>([], null)
+            : new GitHubArrayPage<GitHubApiWorkflowRun>(page.Payload.WorkflowRuns ?? [], page.NextUrl);
     }
 
     public async Task<IReadOnlyList<GitHubApiWorkflowRun>> GetRunAttemptsAsync(
@@ -90,11 +92,23 @@ internal sealed partial class GitHubRestClient(
         while (url is not null)
         {
             var page = await GetObjectPageAsync<GitHubApiArtifactsPage>(url, cancellationToken, notFoundAsEmpty);
+            if (page is null)
+                break;
             if (page.Payload.Artifacts is { Count: > 0 })
                 artifacts.AddRange(page.Payload.Artifacts);
             url = page.NextUrl;
         }
         return artifacts;
+    }
+
+    public async Task<GitHubArtifactsPage> GetRepositoryArtifactsPageAsync(
+        string owner, string name, string? nextPageUrl, int pageSize, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default)
+    {
+        var path = nextPageUrl ?? $"repos/{owner}/{name}/actions/artifacts?per_page={pageSize}";
+        var page = await GetObjectPageAsync<GitHubApiArtifactsPage>(path, cancellationToken, notFoundAsEmpty);
+        return page is null
+            ? new GitHubArtifactsPage([], 0, null)
+            : new GitHubArtifactsPage(page.Payload.Artifacts ?? [], page.Payload.TotalCount, page.NextUrl);
     }
 
     private static string FormatSince(DateTimeOffset? since) =>
@@ -106,21 +120,28 @@ internal sealed partial class GitHubRestClient(
     private static string ToGitHubTimestamp(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture);
 
-    /// <summary>One page of a JSON-array endpoint.</summary>
+    /// <summary>
+    /// One page of a JSON-array endpoint. Returns an empty page when the caller
+    /// asked for 404 to mean "nothing here" - a pull request whose commit
+    /// listing has been pruned, or a run whose attempts are gone, must not
+    /// abort the whole synchronization pass.
+    /// </summary>
     private async Task<GitHubArrayPage<T>> GetArrayPageAsync<T>(string pathOrUrl, CancellationToken ct, bool notFoundAsEmpty = false)
     {
-        using var response = await SendCoreAsync(HttpMethod.Get, pathOrUrl, notFoundAsEmpty, ct)
-            ?? throw new InvalidOperationException("Unreachable: empty response without notFoundAsEmpty.");
+        using var response = await SendCoreAsync(HttpMethod.Get, pathOrUrl, notFoundAsEmpty, ct);
+        if (response is null)
+            return new GitHubArrayPage<T>([], null);
         await using var stream = await response.Content.ReadAsStreamAsync(ct);
         var items = await JsonSerializer.DeserializeAsync<List<T>>(stream, JsonOptions, ct) ?? [];
         return new GitHubArrayPage<T>(items, ParseNextLink(response.Headers));
     }
 
-    /// <summary>One page of an endpoint returning a wrapper object with an array inside.</summary>
-    private async Task<GitHubObjectPage<T>> GetObjectPageAsync<T>(string pathOrUrl, CancellationToken ct, bool notFoundAsEmpty = false)
+    /// <summary>One page of an endpoint returning a wrapper object with an array inside; null when a 404 matched notFoundAsEmpty.</summary>
+    private async Task<GitHubObjectPage<T>?> GetObjectPageAsync<T>(string pathOrUrl, CancellationToken ct, bool notFoundAsEmpty = false)
     {
-        using var response = await SendCoreAsync(HttpMethod.Get, pathOrUrl, notFoundAsEmpty, ct)
-            ?? throw new InvalidOperationException("Unreachable: empty response without notFoundAsEmpty.");
+        using var response = await SendCoreAsync(HttpMethod.Get, pathOrUrl, notFoundAsEmpty, ct);
+        if (response is null)
+            return null;
         await using var stream = await response.Content.ReadAsStreamAsync(ct);
         var payload = await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions, ct)
             ?? throw new GitHubApiException("GitHub returned an empty payload where one was required.");
