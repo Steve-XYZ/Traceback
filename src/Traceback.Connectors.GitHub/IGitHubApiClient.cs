@@ -20,6 +20,19 @@ public sealed class GitHubRateLimitException(string message, DateTimeOffset? res
 /// <summary>Transient failure (network or 5xx) that persisted past the bounded retries.</summary>
 public sealed class GitHubTransientException(string message) : GitHubApiException(message);
 
+/// <summary>
+/// The connector reached its per-stream page safety cap before the provider
+/// listing was complete. The caller must leave the stream checkpoint where it
+/// was and retry after raising the cap (or narrowing the requested window).
+/// </summary>
+public sealed class GitHubPageLimitException(string resourceType, int pagesWalked, int maxPages)
+    : GitHubApiException($"GitHub {resourceType} fetch stopped after {pagesWalked} pages at the configured MaxPagesPerFetch={maxPages}; the stream was not complete.")
+{
+    public string ResourceType { get; } = resourceType;
+    public int PagesWalked { get; } = pagesWalked;
+    public int MaxPages { get; } = maxPages;
+}
+
 /// <summary>A page of array results plus the link-header continuation, if any.</summary>
 internal sealed record GitHubArrayPage<T>(IReadOnlyList<T> Items, string? NextUrl)
 {

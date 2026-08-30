@@ -366,9 +366,11 @@ mechanics are tabulated in
 [integrations/github.md](integrations/github.md#incremental-synchronization).
 
 **Truncation never advances a checkpoint.** Each stream stops after
-`MaxPagesPerFetch` pages. When that cap is hit the stream returns its *previous*
-cursor: what was fetched is committed, the watermark does not move, and the next
-pass redoes the window. A safety valve cannot silently become a data-loss valve.
+`MaxPagesPerFetch` pages. When that cap is hit the source raises a typed page
+limit failure before the batch is ingested. The watermark and data therefore
+stay unchanged, and repeating the same capped request repeats the leading
+window and fails again. Raise the cap or narrow the window before retrying. A
+safety valve cannot silently become a data-loss valve.
 
 ## Workflow rerun modeling
 
