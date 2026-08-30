@@ -133,6 +133,24 @@ public sealed class GitHubRestClientBehaviorTests : IDisposable
     }
 
     [Fact]
+    public async Task GitHub_enterprise_api_path_is_preserved_for_relative_requests()
+    {
+        using var httpClient = new HttpClient(_handler)
+        {
+            BaseAddress = new Uri(GitHubConnectorOptions.NormalizeApiBaseUrl("https://ghe.example/api/v3")),
+        };
+        var client = new GitHubRestClient(
+            httpClient,
+            new StaticTokenProvider("token"),
+            new TestOptionsMonitor<GitHubConnectorOptions>(new GitHubConnectorOptions()));
+        _handler.Queue(Response(200));
+
+        await client.GetRepositoryAsync("acme", "player-manager");
+
+        Assert.Equal("/api/v3/repos/acme/player-manager", _handler.Requests[0].RequestUri?.AbsolutePath);
+    }
+
+    [Fact]
     public async Task Failures_never_expose_the_token()
     {
         for (var i = 0; i < 10; i++)

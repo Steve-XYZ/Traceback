@@ -36,7 +36,7 @@ Settings bind from the `GitHub` configuration section
 |---|---|---|
 | `GitHub:Token` | — | API token. Supply through user secrets or the environment, never a committed file. |
 | `GitHub:TokenFile` | — | Alternative: path to a file containing the token (Docker/Kubernetes secret style). Re-read at most every 30 seconds, so rotation needs no restart. |
-| `GitHub:ApiBaseUrl` | `https://api.github.com/` | Override for GitHub Enterprise Server. |
+| `GitHub:ApiBaseUrl` | `https://api.github.com/` | Override for GitHub Enterprise Server. The connector normalizes a trailing `/`, so `https://ghe.example/api/v3` stays under `/api/v3` for relative API requests. |
 | `GitHub:InitialLookbackDays` | `30` (nonnegative) | History depth of a repository's first synchronization. |
 | `GitHub:IncrementalOverlapDays` | `7` (nonnegative) | How far behind its watermark each stream re-inspects on later passes. |
 | `GitHub:PageSize` | `100` (1–100) | `per_page` for every listing request (GitHub's maximum). |
@@ -49,7 +49,10 @@ Settings bind from the `GitHub` configuration section
 The connector validates these values when the host starts. An empty repository
 list and an unset token remain valid so local fixture-only runs do not need
 GitHub credentials. `GitHub:ApiBaseUrl` must be an absolute `http` or `https`
-URL.
+URL without a query string or fragment. Surrounding whitespace is trimmed and
+a trailing `/` is added before the HTTP client is configured; this is required
+for GitHub Enterprise Server URLs such as `https://ghe.example/api/v3`, because
+the connector uses relative REST paths.
 
 Only repositories listed under `GitHub:Repositories` can be synchronized; the
 admin endpoint rejects anything else with 404 rather than reaching out to an

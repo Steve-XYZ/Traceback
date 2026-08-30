@@ -18,6 +18,25 @@ public sealed class GitHubConnectorOptions
     /// <summary>API base URL; overridable for GitHub Enterprise Server and tests.</summary>
     public string ApiBaseUrl { get; set; } = "https://api.github.com/";
 
+    /// <summary>
+    /// Normalizes a valid API base URL as a directory so relative REST paths
+    /// preserve a GitHub Enterprise Server path such as <c>/api/v3</c>.
+    /// Invalid values are returned trimmed for the validator to report.
+    /// </summary>
+    internal static string NormalizeApiBaseUrl(string? apiBaseUrl)
+    {
+        var trimmed = apiBaseUrl?.Trim() ?? string.Empty;
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return trimmed;
+        }
+
+        var builder = new UriBuilder(uri);
+        builder.Path = builder.Path.TrimEnd('/') + "/";
+        return builder.Uri.AbsoluteUri;
+    }
+
     public int InitialLookbackDays { get; set; } = 30;
 
     /// <summary>Incremental overlap window: streams re-inspect this many days behind their watermark so late-appearing updates (and Actions reruns) cannot be missed.</summary>
@@ -83,6 +102,10 @@ public sealed class GitHubConnectorOptionsValidator : IValidateOptions<GitHubCon
             (apiBaseUrl.Scheme != Uri.UriSchemeHttp && apiBaseUrl.Scheme != Uri.UriSchemeHttps))
         {
             failures.Add("GitHub:ApiBaseUrl must be an absolute HTTP or HTTPS URL.");
+        }
+        else if (!string.IsNullOrEmpty(apiBaseUrl.Query) || !string.IsNullOrEmpty(apiBaseUrl.Fragment))
+        {
+            failures.Add("GitHub:ApiBaseUrl must not include a query string or fragment.");
         }
 
         foreach (var (repository, index) in (options.Repositories ?? []).Select((repository, index) => (repository, index)))

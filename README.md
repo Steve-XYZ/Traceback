@@ -168,6 +168,7 @@ dotnet ef migrations add <Name> \
 | `IngestFixturesOnStartup` | `false` (`true` in compose) | seed the fixture scenario via the ingestion boundary |
 | `GitHub__Token` | unset | read-only GitHub token (user secrets / environment) |
 | `GitHub__TokenFile` | unset | alternative: path to a mounted secret file |
+| `GitHub__ApiBaseUrl` | `https://api.github.com/` | GitHub or GitHub Enterprise API base; trailing `/` is normalized so paths such as `/api/v3` are preserved |
 | `GitHub__Repositories__0__Owner` / `__Name` | unset | the repository to synchronize |
 | `GitHub__InitialLookbackDays` | `30` | history depth of a repository's first sync |
 | `GitHub__IncrementalOverlapDays` | `7` | how far behind each watermark later passes re-inspect |

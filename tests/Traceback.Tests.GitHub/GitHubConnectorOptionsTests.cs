@@ -74,6 +74,43 @@ public sealed class GitHubConnectorOptionsTests
         Assert.False(ftp.Succeeded);
     }
 
+    [Theory]
+    [InlineData("https://ghe.example/api/v3?tenant=acme")]
+    [InlineData("https://ghe.example/api/v3#api")]
+    public void Api_base_url_must_not_include_a_query_or_fragment(string configured)
+    {
+        var result = Validate(new GitHubConnectorOptions { ApiBaseUrl = configured });
+
+        Assert.Contains(Failures(result), failure => failure.Contains("query string or fragment", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("https://api.github.com", "https://api.github.com/")]
+    [InlineData(" https://ghe.example/api/v3 ", "https://ghe.example/api/v3/")]
+    [InlineData("https://ghe.example/api/v3///", "https://ghe.example/api/v3/")]
+    public void Api_base_url_is_normalized_as_a_directory(string configured, string expected)
+    {
+        Assert.Equal(expected, GitHubConnectorOptions.NormalizeApiBaseUrl(configured));
+    }
+
+    [Fact]
+    public void Registered_options_normalize_a_github_enterprise_api_path()
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["GitHub:ApiBaseUrl"] = "https://ghe.example/api/v3",
+            })
+            .Build();
+        var services = new ServiceCollection();
+        services.AddGitHubConnector(configuration);
+        using var provider = services.BuildServiceProvider();
+
+        var options = provider.GetRequiredService<IOptions<GitHubConnectorOptions>>().Value;
+
+        Assert.Equal("https://ghe.example/api/v3/", options.ApiBaseUrl);
+    }
+
     [Fact]
     public void Null_and_blank_repository_binding_is_reported_without_throwing()
     {

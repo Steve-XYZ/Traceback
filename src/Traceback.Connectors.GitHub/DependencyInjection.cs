@@ -17,7 +17,11 @@ public static class DependencyInjection
     {
         services.AddOptions<GitHubConnectorOptions>()
             .Bind(configuration.GetSection(GitHubConnectorOptions.SectionName))
-            .Configure(options => ConfigureComposeRepository(options, configuration))
+            .Configure(options =>
+            {
+                options.ApiBaseUrl = GitHubConnectorOptions.NormalizeApiBaseUrl(options.ApiBaseUrl);
+                ConfigureComposeRepository(options, configuration);
+            })
             .ValidateOnStart();
         services.AddSingleton<IValidateOptions<GitHubConnectorOptions>, GitHubConnectorOptionsValidator>();
         services.AddSingleton<IGitHubTokenProvider, ConfiguredGitHubTokenProvider>();

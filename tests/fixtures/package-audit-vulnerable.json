@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "parameters": "--vulnerable --include-transitive",
+  "sources": ["https://api.nuget.org/v3/index.json"],
+  "projects": [
+    {
+      "path": "src/Traceback.Api/Traceback.Api.csproj",
+      "frameworks": [
+        {
+          "framework": "net10.0",
+          "topLevelPackages": [
+            {
+              "id": "Example.Direct.Package",
+              "requestedVersion": "1.0.0",
+              "resolvedVersion": "1.0.0",
+              "vulnerabilities": [
+                {
+                  "severity": "High",
+                  "advisoryurl": "https://example.test/advisories/direct"
+                }
+              ]
+            }
+          ],
+          "transitivePackages": [
+            {
+              "id": "Example.Transitive.Package",
+              "resolvedVersion": "2.0.0",
+              "vulnerabilities": [
+                {
+                  "severity": "Moderate",
+                  "advisoryurl": "https://example.test/advisories/transitive"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
