@@ -33,9 +33,10 @@ namespace Traceback.Connectors.GitHub;
 ///   pass (see FetchArtifactsAsync) and attach to that run's highest observed
 ///   attempt, because GitHub scopes artifacts to runs, not attempts.
 ///
-/// A pass never advances past truncated data: if the page cap is hit before a
-/// stream finishes walking its window, the previous watermark is returned
-/// again and the next synchronization redoes the window idempotently.
+/// A pass never reports success after truncated data: if the page cap is hit
+/// before a stream finishes walking its window, the source throws a typed
+/// failure. The synchronizer then leaves the stream checkpoint and batch
+/// untouched so a retry cannot mistake the capped window for completion.
 /// </summary>
 internal sealed class GitHubRepositorySyncSource(
     IGitHubApiClient api,
@@ -116,7 +117,6 @@ internal sealed class GitHubRepositorySyncSource(
         var events = new List<TracebackEvent>();
         var inspected = 0;
         var newestSeen = cursor?.NotBefore ?? DateTimeOffset.MinValue;
-        var truncated = false;
 
         string? nextUrl = null;
         var pagesWalked = 0;
@@ -142,21 +142,12 @@ internal sealed class GitHubRepositorySyncSource(
             if (!page.HasNext)
                 break;
             if (pagesWalked >= opts.MaxPagesPerFetch)
-            {
-                truncated = true;
-                break;
-            }
+                throw new GitHubPageLimitException("pull_requests", pagesWalked, opts.MaxPagesPerFetch);
             nextUrl = page.NextUrl;
         }
 
     walkComplete:
-        DateTimeOffset? next;
-        if (truncated)
-            next = cursor?.NotBefore;
-        else if (newestSeen == DateTimeOffset.MinValue)
-            next = null;
-        else
-            next = newestSeen;
+        DateTimeOffset? next = newestSeen == DateTimeOffset.MinValue ? null : newestSeen;
         return new ResourceFetchResult(events, PullRequestCursor.Write(next)) { InspectedCount = inspected };
     }
 
@@ -201,14 +192,14 @@ internal sealed class GitHubRepositorySyncSource(
         string owner, string name, GitHubEventMapper mapper, ResourceFetchRequest request, CancellationToken ct)
     {
         var opts = options.Current;
-        var since = CommitsCursor.TryParse(request.Cursor)?.Since
-            ?? request.Now.AddDays(-request.InitialLookbackDays);
+        var cursor = CommitsCursor.TryParse(request.Cursor);
+        var initial = cursor is null;
+        var since = cursor?.Since ?? request.Now.AddDays(-request.InitialLookbackDays);
         var effectiveSince = since - TimeSpan.FromDays(opts.IncrementalOverlapDays);
 
         var events = new List<TracebackEvent>();
         var inspected = 0;
-        var newestSeen = since;
-        var truncated = false;
+        var newestSeen = cursor?.Since ?? DateTimeOffset.MinValue;
 
         string? nextUrl = null;
         var pagesWalked = 0;
@@ -226,7 +217,7 @@ internal sealed class GitHubRepositorySyncSource(
                 {
                     inspected++;
                     var when = commit.Details?.Committer?.Date ?? commit.Details?.Author?.Date ?? DateTimeOffset.MinValue;
-                    if (when > newestSeen)
+                    if (when > newestSeen && (!initial || when >= since))
                         newestSeen = when;
                     events.Add(mapper.MapCommit(commit));
                 }
@@ -235,18 +226,11 @@ internal sealed class GitHubRepositorySyncSource(
             if (!page.HasNext)
                 break;
             if (pagesWalked >= opts.MaxPagesPerFetch)
-            {
-                truncated = true;
-                break;
-            }
+                throw new GitHubPageLimitException("commits", pagesWalked, opts.MaxPagesPerFetch);
             nextUrl = page.NextUrl;
         }
 
-        DateTimeOffset? next;
-        if (truncated)
-            next = since;
-        else
-            next = newestSeen > since ? newestSeen : since == DateTimeOffset.MinValue ? null : since;
+        DateTimeOffset? next = newestSeen == DateTimeOffset.MinValue ? null : newestSeen;
         return new ResourceFetchResult(events, CommitsCursor.Write(next)) { InspectedCount = inspected };
     }
 
@@ -254,13 +238,13 @@ internal sealed class GitHubRepositorySyncSource(
         string owner, string name, GitHubEventMapper mapper, ResourceFetchRequest request, CancellationToken ct)
     {
         var opts = options.Current;
-        var createdFrom = RunsCursor.TryParse(request.Cursor)?.CreatedFrom
-            ?? request.Now.AddDays(-request.InitialLookbackDays);
+        var cursor = RunsCursor.TryParse(request.Cursor);
+        var initial = cursor is null;
+        var createdFrom = cursor?.CreatedFrom ?? request.Now.AddDays(-request.InitialLookbackDays);
         var effectiveFrom = createdFrom - TimeSpan.FromDays(opts.IncrementalOverlapDays);
 
         var inspected = 0;
-        var newestSeen = createdFrom;
-        var truncated = false;
+        var newestSeen = cursor?.CreatedFrom ?? DateTimeOffset.MinValue;
 
         // Collect the attempts first and emit afterwards: knowing how many runs
         // the pass covers is what lets the artifact fetch pick a strategy.
@@ -280,7 +264,7 @@ internal sealed class GitHubRepositorySyncSource(
             {
                 inspected++;
                 var createdAt = run.CreatedAt ?? DateTimeOffset.MinValue;
-                if (createdAt > newestSeen)
+                if (createdAt > newestSeen && (!initial || createdAt >= createdFrom))
                     newestSeen = createdAt;
 
                 // Reruns: enumerate every attempt so no attempt's history is
@@ -306,10 +290,7 @@ internal sealed class GitHubRepositorySyncSource(
             if (!page.HasNext)
                 break;
             if (pagesWalked >= opts.MaxPagesPerFetch)
-            {
-                truncated = true;
-                break;
-            }
+                throw new GitHubPageLimitException("workflow_runs", pagesWalked, opts.MaxPagesPerFetch);
             nextUrl = page.NextUrl;
         }
 
@@ -334,11 +315,7 @@ internal sealed class GitHubRepositorySyncSource(
             }
         }
 
-        DateTimeOffset? next;
-        if (truncated)
-            next = createdFrom;
-        else
-            next = newestSeen > createdFrom ? newestSeen : createdFrom == DateTimeOffset.MinValue ? null : createdFrom;
+        DateTimeOffset? next = newestSeen == DateTimeOffset.MinValue ? null : newestSeen;
         return new ResourceFetchResult(events, RunsCursor.Write(next)) { InspectedCount = inspected };
     }
 
@@ -389,8 +366,10 @@ internal sealed class GitHubRepositorySyncSource(
                             byRun[id] = list = [];
                         list.Add(artifact);
                     }
-                    if (!page.HasNext || walked >= opts.MaxPagesPerFetch)
+                    if (!page.HasNext)
                         break;
+                    if (walked >= opts.MaxPagesPerFetch)
+                        throw new GitHubPageLimitException("workflow_runs", walked, opts.MaxPagesPerFetch);
                     page = await api.GetRepositoryArtifactsPageAsync(owner, name, page.NextUrl, opts.PageSize, notFoundAsEmpty: true, cancellationToken: ct);
                     walked++;
                 }

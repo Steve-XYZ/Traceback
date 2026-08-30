@@ -6,9 +6,8 @@ namespace Traceback.Tests.Integration;
 /// <summary>
 /// REST list pagination end to end: streams whose listings span several pages
 /// are fully ingested in one pass, the configured page size reaches the
-/// provider's requests, and the per-pass page cap truncates a walk without
-/// advancing its checkpoint, so the next pass redoes the window idempotently
-/// instead of silently skipping data behind the cap.
+/// provider's requests, and the per-pass page cap reports a stream failure
+/// without ingesting a partial batch or advancing its checkpoint.
 /// </summary>
 [Collection(PostgresTestCollection.Name)]
 public sealed class GitHubPaginationTests(PostgresContainerFixture postgres)
@@ -92,7 +91,7 @@ public sealed class GitHubPaginationTests(PostgresContainerFixture postgres)
     }
 
     [Fact]
-    public async Task Page_cap_truncates_without_advancing_the_checkpoint_and_the_next_pass_completes()
+    public async Task Repeated_page_cap_failures_do_not_report_progress_until_the_cap_is_raised()
     {
         var world = GitHubSyncHarness.NewWorld();
         for (var i = 1; i <= 5; i++)
@@ -111,15 +110,24 @@ public sealed class GitHubPaginationTests(PostgresContainerFixture postgres)
 
         var firstPass = await GitHubSyncHarness.SyncAsync(appA);
 
-        // The cap is a safety valve, not an error: what was fetched is durable...
-        Assert.True(firstPass.Success, FailureMessage(firstPass));
-        Assert.Equal(4, await GitHubSyncHarness.CountRowsAsync(appA, "pull_requests"));
-        // ...and the checkpoint did not advance past truncated data.
+        // A capped stream is an observable failure. Its partial batch is not
+        // ingested and the checkpoint does not advance.
+        Assert.False(firstPass.Success, FailureMessage(firstPass));
+        Assert.StartsWith("pull_requests:", firstPass.Error, StringComparison.Ordinal);
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "pull_requests"));
         var prOutcome = firstPass.Resources.Single(r => r.ResourceType == "pull_requests");
         Assert.False(prOutcome.CursorAdvanced);
         Assert.Equal(string.Empty, await CursorAsync(appA, "pull_requests"));
 
-        // A later pass without the cap redoes the window and converges.
+        // Repeating the identical capped request remains a failure rather than
+        // falsely claiming that the leading window was complete.
+        var repeatedPass = await GitHubSyncHarness.SyncAsync(appA);
+        Assert.False(repeatedPass.Success, FailureMessage(repeatedPass));
+        Assert.StartsWith("pull_requests:", repeatedPass.Error, StringComparison.Ordinal);
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "pull_requests"));
+        Assert.Equal(string.Empty, await CursorAsync(appA, "pull_requests"));
+
+        // A later pass without the cap walks the full window and converges.
         await using var appB = await TracebackApp.RestartAgainstSameDatabaseAsync(
             postgres.Container,
             appA.DatabaseName,
@@ -129,7 +137,7 @@ public sealed class GitHubPaginationTests(PostgresContainerFixture postgres)
         var secondPass = AssertSynced(await GitHubSyncHarness.SyncAsync(appB));
 
         Assert.Equal(5, await GitHubSyncHarness.CountRowsAsync(appB, "pull_requests"));
-        Assert.True(secondPass.TotalDuplicates > 0);
+        Assert.True(secondPass.TotalDuplicates > 0); // repository metadata was redelivered.
         Assert.NotEqual(string.Empty, await CursorAsync(appB, "pull_requests"));
     }
 

@@ -23,7 +23,7 @@ public sealed class GitHubConnectorOptions
 
     public int PageSize { get; set; } = 100;
 
-    /// <summary>Safety cap on pages walked per stream pass; when hit, that stream's cursor is not advanced so no data is skipped silently.</summary>
+    /// <summary>Safety cap on pages walked per stream pass; when hit, that stream fails before ingestion and its cursor is not advanced.</summary>
     public int MaxPagesPerFetch { get; set; } = 200;
 
     public int MaxRetries { get; set; } = 3;
