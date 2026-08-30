@@ -123,6 +123,35 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
     }
 
     [Fact]
+    public async Task Initial_commit_and_workflow_passes_exclude_overlap_only_items()
+    {
+        var oldSha = "3333333333333333333333333333333333333333";
+        var oldAt = Now.AddDays(-35); // In the incremental overlap, outside the initial window.
+        World.Commits.Add(new FakeCommit
+        {
+            Sha = oldSha,
+            AuthorDate = oldAt,
+            CommitterDate = oldAt,
+        });
+        World.AddRun(new FakeRun
+        {
+            Id = 8301,
+            HeadSha = oldSha,
+            CreatedAt = oldAt,
+            UpdatedAt = oldAt,
+            RunStartedAt = oldAt,
+        });
+
+        var commits = await _source.FetchAsync(Fetch("commits", cursor: null));
+        var workflows = await _source.FetchAsync(Fetch("workflow_runs", cursor: null));
+
+        Assert.Empty(commits.Events.OfType<CommitObserved>());
+        Assert.Null(commits.NextCursor);
+        Assert.Empty(workflows.Events.OfType<WorkflowRunObserved>());
+        Assert.Null(workflows.NextCursor);
+    }
+
+    [Fact]
     public async Task Rerun_enumerates_every_attempt_and_attaches_artifacts_to_the_highest()
     {
         // The runs listing exposes only the latest attempt (attempt 2 here);

@@ -195,7 +195,9 @@ internal sealed class GitHubRepositorySyncSource(
         var cursor = CommitsCursor.TryParse(request.Cursor);
         var initial = cursor is null;
         var since = cursor?.Since ?? request.Now.AddDays(-request.InitialLookbackDays);
-        var effectiveSince = since - TimeSpan.FromDays(opts.IncrementalOverlapDays);
+        var effectiveSince = initial
+            ? since
+            : since - TimeSpan.FromDays(opts.IncrementalOverlapDays);
 
         var events = new List<TracebackEvent>();
         var inspected = 0;
@@ -241,7 +243,9 @@ internal sealed class GitHubRepositorySyncSource(
         var cursor = RunsCursor.TryParse(request.Cursor);
         var initial = cursor is null;
         var createdFrom = cursor?.CreatedFrom ?? request.Now.AddDays(-request.InitialLookbackDays);
-        var effectiveFrom = createdFrom - TimeSpan.FromDays(opts.IncrementalOverlapDays);
+        var effectiveFrom = initial
+            ? createdFrom
+            : createdFrom - TimeSpan.FromDays(opts.IncrementalOverlapDays);
 
         var inspected = 0;
         var newestSeen = cursor?.CreatedFrom ?? DateTimeOffset.MinValue;

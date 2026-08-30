@@ -128,12 +128,15 @@ The first pass for a repository has no checkpoint, so each stream uses
 An empty initial stream leaves its cursor null. A cursor is written only after
 the stream observes an in-window provider timestamp and its events are stored.
 
-Every listing follows the `Link: rel="next"` header until it is absent, so no
-stream stops at the first page. If a stream reaches `MaxPagesPerFetch` first,
-the source reports a `GitHubPageLimitException`; the partial batch is not
-ingested and the checkpoint does not move. Repeating the same request with the
-same cap repeats the leading window and fails again. Raise the cap or narrow
-the requested lookback before retrying.
+Each listing follows the `Link: rel="next"` header while it can still return
+items in the stream's lookback window: pull requests stop at the window floor,
+and commits/workflow runs use that floor as their provider-side filter. All
+walks are also subject to `MaxPagesPerFetch`, so a stream can fail before the
+next link is absent. In that case the source reports a
+`GitHubPageLimitException`; the partial batch is not ingested and the
+checkpoint does not move. Repeating the same request with the same cap repeats
+the leading window and fails again. Raise the cap or narrow the requested
+lookback before retrying.
 
 ### Two ways to fetch artifacts
 
