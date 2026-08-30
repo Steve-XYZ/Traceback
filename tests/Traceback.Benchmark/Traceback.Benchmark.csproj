@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+    <RootNamespace>Traceback.Benchmark</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Traceback.Connectors.GitHub\Traceback.Connectors.GitHub.csproj" />
+    <ProjectReference Include="..\..\src\Traceback.Infrastructure\Traceback.Infrastructure.csproj" />
+    <ProjectReference Include="..\Traceback.Tests.GitHubSupport\Traceback.Tests.GitHubSupport.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Testcontainers.PostgreSql" />
+    <PackageReference Include="Npgsql" />
+  </ItemGroup>
+</Project>

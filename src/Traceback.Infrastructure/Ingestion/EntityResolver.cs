@@ -39,7 +39,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
             return (SourceRepository)cached;
 
         var identity = await FindIdentityAsync(provider, ExternalEntityTypes.Repository, normalizedKey, ct);
-        var repo = identity?.SourceRepository;
+        var repo = await LoadAsync<SourceRepository>(identity?.SourceRepositoryId, ct);
         if (repo is null)
         {
             repo = await db.SourceRepositories.FirstOrDefaultAsync(
@@ -78,10 +78,11 @@ internal sealed class EntityResolver(TracebackDbContext db)
             return (WorkItem)cachedWorkItem;
 
         var identity = await FindIdentityAsync(provider, ExternalEntityTypes.WorkItem, key, ct);
+        var mapped = await LoadAsync<WorkItem>(identity?.WorkItemId, ct);
         WorkItem item;
-        if (identity?.WorkItem is not null)
+        if (mapped is not null)
         {
-            item = identity.WorkItem;
+            item = mapped;
         }
         else
         {
@@ -121,7 +122,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
             return (PullRequest)cached;
 
         var identity = await FindIdentityAsync(provider, ExternalEntityTypes.PullRequest, externalName, ct);
-        var pr = identity?.PullRequest;
+        var pr = await LoadAsync<PullRequest>(identity?.PullRequestId, ct);
         if (pr is null)
         {
             pr = new PullRequest
@@ -172,7 +173,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
             repo = await ResolveRepositoryAsync(provider, repositoryKey, observedAt, ct);
 
         var identity = await FindIdentityAsync(provider, ExternalEntityTypes.Commit, identityKey, ct);
-        var commit = identity?.Commit;
+        var commit = await LoadAsync<Commit>(identity?.CommitId, ct);
 
         if (commit is null && repo is not null)
         {
@@ -228,7 +229,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
             return (WorkflowRun)cached;
 
         var identity = await FindIdentityAsync(provider, ExternalEntityTypes.WorkflowRun, externalName, ct);
-        var run = identity?.WorkflowRun;
+        var run = await LoadAsync<WorkflowRun>(identity?.WorkflowRunId, ct);
         if (run is null)
         {
             run = new WorkflowRun
@@ -281,17 +282,20 @@ internal sealed class EntityResolver(TracebackDbContext db)
         if (digestKey is not null)
         {
             matchedIdentity = await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, digestKey, ct);
-            artifact ??= matchedIdentity?.BuildArtifact ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == digestKey, ct);
+            artifact ??= await LoadAsync<BuildArtifact>(matchedIdentity?.BuildArtifactId, ct)
+                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == digestKey, ct);
         }
         if (artifact is null && externalKey is not null)
         {
             matchedIdentity ??= await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, externalKey, ct);
-            artifact ??= matchedIdentity?.BuildArtifact ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == externalKey, ct);
+            artifact ??= await LoadAsync<BuildArtifact>(matchedIdentity?.BuildArtifactId, ct)
+                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == externalKey, ct);
         }
         if (artifact is null && versionKey is not null)
         {
             matchedIdentity ??= await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, versionKey, ct);
-            artifact ??= matchedIdentity?.BuildArtifact ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == versionKey, ct);
+            artifact ??= await LoadAsync<BuildArtifact>(matchedIdentity?.BuildArtifactId, ct)
+                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.CanonicalKey == versionKey, ct);
         }
         if (artifact is not null)
         {
@@ -419,12 +423,20 @@ internal sealed class EntityResolver(TracebackDbContext db)
         return engineer;
     }
 
+    /// <summary>
+    /// Looks up one identity row. Deliberately without Include: an identity has
+    /// ten typed foreign keys and eager-loading all of them turns a single-row
+    /// index seek into an eleven-relation LEFT JOIN that PostgreSQL has to plan
+    /// on every call. Callers load the one entity the row actually points at
+    /// with <see cref="LoadAsync{TEntity}"/> instead.
+    /// </summary>
     private Task<ExternalIdentity?> FindIdentityAsync(string provider, string entityType, string key, CancellationToken ct) =>
         db.ExternalIdentities
-            .Include(i => i.SourceRepository).Include(i => i.WorkItem).Include(i => i.PullRequest).Include(i => i.Commit)
-            .Include(i => i.WorkflowRun).Include(i => i.BuildArtifact).Include(i => i.Deployment)
-            .Include(i => i.Service).Include(i => i.Environment).Include(i => i.ServiceInstance)
             .FirstOrDefaultAsync(i => i.Provider == provider && i.EntityTypeName == entityType && i.ExternalKey == key, ct);
+
+    /// <summary>Loads the entity an identity points at; already-tracked rows resolve without a round trip.</summary>
+    private async ValueTask<TEntity?> LoadAsync<TEntity>(Guid? id, CancellationToken ct) where TEntity : class =>
+        id is { } value ? await db.Set<TEntity>().FindAsync([value], ct) : null;
 
     private Task<ExternalIdentity?> FindAnyProviderIdentityAsync(string entityType, string key, CancellationToken ct) =>
         db.ExternalIdentities

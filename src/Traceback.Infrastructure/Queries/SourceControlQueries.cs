@@ -264,20 +264,24 @@ internal sealed class SourceControlQueries(TracebackDbContext db) : ISourceContr
         if (repository is null)
             return null;
 
-        var hasCursor = ChangesCursorCodec.TryDecode(cursor, out var cursorTime, out var cursorKind, out var cursorId);
+        var position = ChangesCursorCodec.TryDecode(cursor, out var cursorTime, out var cursorKind, out var cursorId)
+            ? new ChangesPosition(cursorTime, cursorKind, cursorId)
+            : null;
 
-        // Each stream contributes at most `limit` candidates past the cursor;
-        // merging them preserves the global newest-first page because every
-        // entry on the final page must appear among its own stream's top slice.
-        var prTask = StreamPullRequestsAsync(repository.Id, fromUtc, toUtc, hasCursor ? cursorKind : null, hasCursor ? cursorTime : null, hasCursor ? cursorId : null, limit, ct);
-        var commitTask = StreamCommitsAsync(repository.Id, fromUtc, toUtc, hasCursor ? cursorKind : null, hasCursor ? cursorTime : null, hasCursor ? cursorId : null, limit, ct);
-        var runTask = StreamWorkflowRunsAsync(repository.Id, fromUtc, toUtc, hasCursor ? cursorKind : null, hasCursor ? cursorTime : null, hasCursor ? cursorId : null, limit, ct);
-        await Task.WhenAll(prTask, commitTask, runTask);
+        // The three streams run one after another: they share a single
+        // DbContext, which allows exactly one in-flight operation. Each returns
+        // at most `limit` candidates positioned after the cursor, so merging
+        // them yields the true global page - any entry belonging on this page
+        // must appear within its own stream's top slice.
+        var candidates = new List<ChangeEntry>(limit * 3);
+        candidates.AddRange(await StreamPullRequestsAsync(repository.Id, fromUtc, toUtc, position, limit, ct));
+        candidates.AddRange(await StreamCommitsAsync(repository.Id, fromUtc, toUtc, position, limit, ct));
+        candidates.AddRange(await StreamWorkflowRunsAsync(repository.Id, fromUtc, toUtc, position, limit, ct));
 
-        var entries = prTask.Result.Concat(commitTask.Result).Concat(runTask.Result)
+        var entries = candidates
             .OrderByDescending(e => e.OccurredAt)
             .ThenBy(e => e.Kind, StringComparer.Ordinal)
-            .ThenByDescending(e => e.EntityId)
+            .ThenByDescending(e => e.EntityId, ChangesPosition.EntityIdOrder)
             .Take(limit)
             .ToList();
 
@@ -300,99 +304,77 @@ internal sealed class SourceControlQueries(TracebackDbContext db) : ISourceContr
         };
     }
 
-    // Keyset helpers: strictly-newer-than-cursor predicates per stream.
-
     private async Task<List<ChangeEntry>> StreamPullRequestsAsync(
-        Guid repoId, DateTimeOffset from, DateTimeOffset to, string? cursorKind, DateTimeOffset? cursorTime, Guid? cursorId, int limit, CancellationToken ct)
+        Guid repoId, DateTimeOffset from, DateTimeOffset to, ChangesPosition? position, int limit, CancellationToken ct)
     {
-        var stopAfterCursor = cursorKind == ChangesCursorCodec.KindPullRequest && cursorTime is not null;
-        var rows = await db.PullRequests.AsNoTracking()
-            .Where(p => p.SourceRepositoryId == repoId)
-            .Where(p => (p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt) >= from && (p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt) <= to)
-            .OrderByDescending(p => p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt)
-            .ThenByDescending(p => p.Id)
-            .ToListAsync(ct);
+        var rows = await TimelinePage.LoadAsync(
+            db.PullRequests.AsNoTracking()
+                .Where(p => p.SourceRepositoryId == repoId)
+                .Select(p => new TimelineRow<PullRequest>
+                {
+                    OccurredAt = p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt,
+                    EntityId = p.Id,
+                    Entity = p,
+                }),
+            from, to, ChangesCursorCodec.KindPullRequest, position, limit, ct);
 
-        IEnumerable<PullRequest> filtered = rows;
-        if (stopAfterCursor)
+        return rows.ConvertAll(r => new ChangeEntry
         {
-            filtered = rows.SkipWhile(p =>
-                (p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt) > cursorTime ||
-                ((p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt) == cursorTime && p.Id >= cursorId!.Value));
-        }
-
-        return filtered
-            .Take(limit)
-            .Select(p => new ChangeEntry
-            {
-                OccurredAt = p.UpdatedAt ?? p.CreatedAt ?? p.LastObservedAt,
-                Kind = ChangesCursorCodec.KindPullRequest,
-                EntityId = p.Id,
-                PullRequest = new PullRequestChange(p.ExternalName, p.Number, p.Title, p.State, p.Url, p.CreatedAt, p.UpdatedAt, p.MergedAt),
-            })
-            .ToList();
+            OccurredAt = r.OccurredAt,
+            Kind = ChangesCursorCodec.KindPullRequest,
+            EntityId = r.EntityId,
+            PullRequest = new PullRequestChange(
+                r.Entity.ExternalName, r.Entity.Number, r.Entity.Title, r.Entity.State, r.Entity.Url,
+                r.Entity.CreatedAt, r.Entity.UpdatedAt, r.Entity.MergedAt),
+        });
     }
 
     private async Task<List<ChangeEntry>> StreamCommitsAsync(
-        Guid repoId, DateTimeOffset from, DateTimeOffset to, string? cursorKind, DateTimeOffset? cursorTime, Guid? cursorId, int limit, CancellationToken ct)
+        Guid repoId, DateTimeOffset from, DateTimeOffset to, ChangesPosition? position, int limit, CancellationToken ct)
     {
-        var stopAfterCursor = cursorKind == ChangesCursorCodec.KindCommit && cursorTime is not null;
-        var rows = await db.Commits.AsNoTracking()
-            .Where(c => c.SourceRepositoryId == repoId)
-            .Where(c => (c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt) >= from && (c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt) <= to)
-            .OrderByDescending(c => c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt)
-            .ThenByDescending(c => c.Id)
-            .ToListAsync(ct);
+        var rows = await TimelinePage.LoadAsync(
+            db.Commits.AsNoTracking()
+                .Where(c => c.SourceRepositoryId == repoId)
+                .Select(c => new TimelineRow<Commit>
+                {
+                    OccurredAt = c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt,
+                    EntityId = c.Id,
+                    Entity = c,
+                }),
+            from, to, ChangesCursorCodec.KindCommit, position, limit, ct);
 
-        IEnumerable<Commit> filtered = rows;
-        if (stopAfterCursor)
+        return rows.ConvertAll(r => new ChangeEntry
         {
-            filtered = rows.SkipWhile(c =>
-                (c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt) > cursorTime ||
-                ((c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt) == cursorTime && c.Id >= cursorId!.Value));
-        }
-
-        return filtered
-            .Take(limit)
-            .Select(c => new ChangeEntry
-            {
-                OccurredAt = c.AuthoredAt ?? c.CommittedAt ?? c.LastObservedAt,
-                Kind = ChangesCursorCodec.KindCommit,
-                EntityId = c.Id,
-                Commit = new CommitChange(c.Sha, c.Message, c.AuthoredAt),
-            })
-            .ToList();
+            OccurredAt = r.OccurredAt,
+            Kind = ChangesCursorCodec.KindCommit,
+            EntityId = r.EntityId,
+            Commit = new CommitChange(r.Entity.Sha, r.Entity.Message, r.Entity.AuthoredAt),
+        });
     }
 
     private async Task<List<ChangeEntry>> StreamWorkflowRunsAsync(
-        Guid repoId, DateTimeOffset from, DateTimeOffset to, string? cursorKind, DateTimeOffset? cursorTime, Guid? cursorId, int limit, CancellationToken ct)
+        Guid repoId, DateTimeOffset from, DateTimeOffset to, ChangesPosition? position, int limit, CancellationToken ct)
     {
-        var stopAfterCursor = cursorKind == ChangesCursorCodec.KindWorkflowRun && cursorTime is not null;
-        var rows = await db.WorkflowRuns.AsNoTracking()
-            .Where(r => r.SourceRepositoryId == repoId)
-            .Where(r => (r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt) >= from && (r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt) <= to)
-            .OrderByDescending(r => r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt)
-            .ThenByDescending(r => r.Id)
-            .ToListAsync(ct);
+        var rows = await TimelinePage.LoadAsync(
+            db.WorkflowRuns.AsNoTracking()
+                .Where(r => r.SourceRepositoryId == repoId)
+                .Select(r => new TimelineRow<WorkflowRun>
+                {
+                    OccurredAt = r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt,
+                    EntityId = r.Id,
+                    Entity = r,
+                }),
+            from, to, ChangesCursorCodec.KindWorkflowRun, position, limit, ct);
 
-        IEnumerable<WorkflowRun> filtered = rows;
-        if (stopAfterCursor)
+        return rows.ConvertAll(r => new ChangeEntry
         {
-            filtered = rows.SkipWhile(r =>
-                (r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt) > cursorTime ||
-                ((r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt) == cursorTime && r.Id >= cursorId!.Value));
-        }
-
-        return filtered
-            .Take(limit)
-            .Select(r => new ChangeEntry
-            {
-                OccurredAt = r.StartedAt ?? r.CompletedAt ?? r.LastObservedAt,
-                Kind = ChangesCursorCodec.KindWorkflowRun,
-                EntityId = r.Id,
-                WorkflowRun = new WorkflowRunChange(r.ExternalName, r.RunId, r.RunAttempt, r.WorkflowName, r.Status, r.Conclusion, r.StartedAt),
-            })
-            .ToList();
+            OccurredAt = r.OccurredAt,
+            Kind = ChangesCursorCodec.KindWorkflowRun,
+            EntityId = r.EntityId,
+            WorkflowRun = new WorkflowRunChange(
+                r.Entity.ExternalName, r.Entity.RunId, r.Entity.RunAttempt, r.Entity.WorkflowName,
+                r.Entity.Status, r.Entity.Conclusion, r.Entity.StartedAt),
+        });
     }
 
     private Task<SourceRepository?> FindRepositoryAsync(string owner, string repo, CancellationToken ct)
@@ -441,5 +423,87 @@ internal sealed class SyncStateQueries(TracebackDbContext db) : ISyncStateQuerie
         return rows
             .Select(s => new SyncStateView(s.IntegrationId, s.ResourceType, s.Cursor, s.LastSuccessAt, s.LastAttemptAt, s.LastError, s.UpdatedAt))
             .ToList();
+    }
+}
+
+/// <summary>
+/// A decoded position on the repository change timeline. The global order is
+/// (occurred descending, kind ordinal ascending, entity id descending); every
+/// stream must resume strictly after this point or pages would repeat entries
+/// that other streams already emitted.
+/// </summary>
+internal sealed record ChangesPosition(DateTimeOffset OccurredAt, string Kind, Guid EntityId)
+{
+    /// <summary>
+    /// Guid ordering that matches PostgreSQL's <c>uuid</c> ordering (byte-wise
+    /// over the canonical textual form), so a database-side ORDER BY and the
+    /// in-memory merge agree on the same prefix. .NET's default Guid comparer
+    /// orders by struct field and would disagree.
+    /// </summary>
+    public static readonly IComparer<Guid> EntityIdOrder =
+        Comparer<Guid>.Create((a, b) => string.CompareOrdinal(a.ToString("N"), b.ToString("N")));
+
+    /// <summary>True when the given entry sorts strictly after this position.</summary>
+    public bool IsAfter(DateTimeOffset occurredAt, string kind, Guid entityId)
+    {
+        if (occurredAt != OccurredAt)
+            return occurredAt < OccurredAt;
+        var byKind = string.CompareOrdinal(kind, Kind);
+        if (byKind != 0)
+            return byKind > 0;
+        return EntityIdOrder.Compare(entityId, EntityId) < 0;
+    }
+}
+
+/// <summary>One timeline candidate: its ordering key plus the row behind it.</summary>
+internal sealed class TimelineRow<TEntity>
+{
+    public DateTimeOffset OccurredAt { get; init; }
+    public Guid EntityId { get; init; }
+    public TEntity Entity { get; init; } = default!;
+}
+
+internal static class TimelinePage
+{
+    /// <summary>
+    /// Loads at most <paramref name="limit"/> window-filtered rows that sort
+    /// after <paramref name="position"/>. Rows strictly older than the cursor
+    /// time are bounded in SQL; rows at exactly the cursor time (the tie
+    /// bucket, a handful in practice) are filtered in memory so the query never
+    /// depends on provider-specific uuid comparison being translatable.
+    /// </summary>
+    public static async Task<List<TimelineRow<TEntity>>> LoadAsync<TEntity>(
+        IQueryable<TimelineRow<TEntity>> source,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        string kind,
+        ChangesPosition? position,
+        int limit,
+        CancellationToken ct)
+    {
+        var windowed = source.Where(r => r.OccurredAt >= from && r.OccurredAt <= to);
+
+        if (position is not { } cursor)
+        {
+            return await windowed
+                .OrderByDescending(r => r.OccurredAt)
+                .ThenByDescending(r => r.EntityId)
+                .Take(limit)
+                .ToListAsync(ct);
+        }
+
+        var older = await windowed
+            .Where(r => r.OccurredAt < cursor.OccurredAt)
+            .OrderByDescending(r => r.OccurredAt)
+            .ThenByDescending(r => r.EntityId)
+            .Take(limit)
+            .ToListAsync(ct);
+
+        var tied = await windowed
+            .Where(r => r.OccurredAt == cursor.OccurredAt)
+            .ToListAsync(ct);
+
+        older.AddRange(tied.Where(r => cursor.IsAfter(r.OccurredAt, kind, r.EntityId)));
+        return older;
     }
 }

@@ -10,6 +10,8 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Traceback.Tests.Domain/Traceback.Tests.Domain.csproj" />
+    <Project Path="tests/Traceback.Tests.GitHub/Traceback.Tests.GitHub.csproj" />
+    <Project Path="tests/Traceback.Tests.GitHubSupport/Traceback.Tests.GitHubSupport.csproj" />
     <Project Path="tests/Traceback.Tests.Integration/Traceback.Tests.Integration.csproj" />
   </Folder>
 </Solution>

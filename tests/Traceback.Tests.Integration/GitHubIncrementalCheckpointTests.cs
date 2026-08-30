@@ -120,6 +120,59 @@ public sealed class GitHubIncrementalCheckpointTests(PostgresContainerFixture po
         Assert.Equal(watermarkAfterFirst, await CursorAsync(app, "commits", "since"));
     }
 
+    [Fact]
+    public async Task Checkpoints_survive_a_restart_and_the_next_pass_stays_incremental()
+    {
+        var world = GitHubSyncHarness.NewWorld();
+        SeedPullRequest(world, number: 1, updatedAt: T0, committedAt: T0.AddHours(-1));
+        world.AddRun(new FakeRun
+        {
+            Id = 910,
+            HeadSha = "chk0001".PadRight(40, 'a'),
+            Status = "completed",
+            Conclusion = "success",
+            CreatedAt = T0.AddHours(-2),
+            UpdatedAt = T0.AddHours(-2),
+            RunStartedAt = T0.AddHours(-2),
+        });
+
+        // The database outlives the first host, exactly as it would across a
+        // container restart or redeploy.
+        await using var original = await StartWithWorldsAsync(postgres.Container, world);
+        AssertSynced(await GitHubSyncHarness.SyncAsync(original));
+        var checkpoints = await AllCursorsAsync(original);
+        var observations = await GitHubSyncHarness.CountRowsAsync(original, "observations");
+        Assert.Equal(4, checkpoints.Count);
+
+        await using var restarted = await TracebackApp.RestartAgainstSameDatabaseAsync(
+            postgres.Container,
+            original.DatabaseName,
+            configureServices: GitHubSyncHarness.WireFakeTransport(world),
+            settings: GitHubSyncHarness.DefaultSettings());
+
+        // Checkpoints are database state, not process state.
+        Assert.Equal(checkpoints, await AllCursorsAsync(restarted));
+
+        var afterRestart = AssertSynced(await GitHubSyncHarness.SyncAsync(restarted));
+
+        // The pass resumes from the stored watermarks: nothing is re-imported
+        // and the history stays exactly one observation per external fact.
+        Assert.Equal(0, afterRestart.TotalObservationsApplied);
+        Assert.True(afterRestart.TotalDuplicates > 0);
+        Assert.Equal(observations, await GitHubSyncHarness.CountRowsAsync(restarted, "observations"));
+        Assert.Equal(checkpoints, await AllCursorsAsync(restarted));
+    }
+
+    /// <summary>Every stored checkpoint for the test repository, by resource type.</summary>
+    private static async Task<Dictionary<string, string>> AllCursorsAsync(TracebackApp app)
+    {
+        var rows = await GitHubSyncHarness.QueryAsync(app,
+            "SELECT resource_type || '=' || coalesce(cursor, '') FROM sync_states " +
+            "WHERE integration_id = $1 ORDER BY resource_type",
+            $"github/{GitHubSyncHarness.Owner}/{GitHubSyncHarness.Name}");
+        return rows.Select(r => r.Split('=', 2)).ToDictionary(p => p[0], p => p[1]);
+    }
+
     private static ResourceSyncOutcome Outcome(RepositorySyncResult result, string resourceType) =>
         result.Resources.Single(r => r.ResourceType == resourceType);
 

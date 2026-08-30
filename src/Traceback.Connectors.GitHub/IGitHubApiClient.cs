@@ -29,6 +29,12 @@ internal sealed record GitHubArrayPage<T>(IReadOnlyList<T> Items, string? NextUr
 /// <summary>A page whose payload is a wrapper object plus the link-header continuation.</summary>
 internal sealed record GitHubObjectPage<T>(T Payload, string? NextUrl);
 
+/// <summary>Artifacts page plus the repository-wide total the API reports.</summary>
+internal sealed record GitHubArtifactsPage(IReadOnlyList<GitHubApiArtifact> Items, int TotalCount, string? NextUrl)
+{
+    public bool HasNext => !string.IsNullOrEmpty(NextUrl);
+}
+
 /// <summary>
 /// Transport abstraction over the GitHub REST API: authentication, bounded
 /// retries with backoff, deliberate rate-limit handling, Link-header paging,
@@ -55,4 +61,12 @@ internal interface IGitHubApiClient
 
     Task<IReadOnlyList<GitHubApiArtifact>> GetRunArtifactsAsync(
         string owner, string name, long runId, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// One page of the repository-wide artifacts listing. Each artifact names
+    /// the run that produced it, so a whole pass's artifacts can be fetched in
+    /// a few requests instead of one per run.
+    /// </summary>
+    Task<GitHubArtifactsPage> GetRepositoryArtifactsPageAsync(
+        string owner, string name, string? nextPageUrl, int pageSize, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default);
 }

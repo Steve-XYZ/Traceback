@@ -291,7 +291,9 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
     private async Task ApplyAsync(ServiceInstanceObserved e, CancellationToken ct)
     {
         var identity = await FindServiceInstanceIdentityAsync(e.Provenance.Provider, e.ExternalName, ct);
-        var instance = identity?.ServiceInstance;
+        var instance = identity?.ServiceInstanceId is { } instanceId
+            ? await db.ServiceInstances.FindAsync([instanceId], ct)
+            : null;
 
         if (instance is null)
         {
@@ -333,7 +335,6 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
 
     private Task<ExternalIdentity?> FindServiceInstanceIdentityAsync(string provider, string externalName, CancellationToken ct) =>
         db.ExternalIdentities
-            .Include(i => i.ServiceInstance)
             .FirstOrDefaultAsync(i => i.Provider == provider && i.EntityTypeName == ExternalEntityTypes.ServiceInstance && i.ExternalKey == externalName, ct);
 
     internal Observation? CurrentObservation { get; set; }
