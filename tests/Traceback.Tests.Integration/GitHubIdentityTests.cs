@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Testcontainers.PostgreSql;
 using Traceback.Application.Ingestion;
+using Traceback.Connectors.Abstractions;
 using Traceback.Infrastructure.Persistence;
 using Traceback.Tests.GitHubSupport;
 
@@ -145,6 +146,40 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
 
         AssertSynced(await SyncAllAsync(app));
         Assert.Equal(2, (await ArtifactIdentityKeysAsync(app)).Count);
+    }
+
+    [Fact]
+    public async Task Artifact_cache_hit_merges_later_digest_uri_and_alias()
+    {
+        const string canonicalKey = "acme/player-manager/actions/artifacts/7003";
+        const string digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const string uri = "https://api.github.test/download/7003";
+        var occurredAt = new DateTimeOffset(2026, 8, 24, 10, 0, 0, TimeSpan.Zero);
+        var observedAt = new DateTimeOffset(2026, 8, 25, 10, 0, 0, TimeSpan.Zero);
+        var first = new BuildArtifactObserved(
+            new EventProvenance("github", "build_artifact", canonicalKey, null, occurredAt, observedAt),
+            new ArtifactDescriptor("test-results", null, null, null, canonicalKey));
+        var second = new BuildArtifactObserved(
+            new EventProvenance("github", "build_artifact", canonicalKey, uri, occurredAt, observedAt),
+            new ArtifactDescriptor("test-results", null, digest, uri, canonicalKey));
+
+        await using var app = await StartWithWorlds(postgres.Container, GitHubSyncHarness.NewWorld());
+
+        var result = await app.IngestAsync([first, second]);
+
+        Assert.Equal(2, result.Applied);
+        Assert.Equal(
+            $"{digest}|{uri}",
+            (await GitHubSyncHarness.QueryAsync(
+                app,
+                "SELECT digest || '|' || uri FROM build_artifacts WHERE canonical_key = $1",
+                canonicalKey))[0]);
+        Assert.Equal(
+            [
+                $"github|{canonicalKey}",
+                $"github|{digest}",
+            ],
+            await ArtifactIdentityKeysAsync(app));
     }
 
     [Fact]

@@ -267,16 +267,21 @@ internal sealed class EntityResolver(TracebackDbContext db)
         var digestKey = ArtifactDescriptorKeys.DigestKey(descriptor);
         var externalKey = ArtifactDescriptorKeys.ExternalKey(descriptor);
         var versionKey = ArtifactDescriptorKeys.VersionKey(descriptor);
+        BuildArtifact? artifact = null;
 
         // Memo-first: artifacts created (or resolved) earlier in this batch may
         // not be flushed yet, so database lookups alone would duplicate them.
+        // Keep the hit in the normal merge path below: a later descriptor can
+        // add a digest, URI, or alias to an artifact already seen in this batch.
         foreach (var key in new[] { digestKey, externalKey, versionKey })
         {
             if (key is not null && _artifactCache.TryGetValue(key, out var cachedArtifact))
-                return cachedArtifact;
+            {
+                artifact = cachedArtifact;
+                break;
+            }
         }
 
-        BuildArtifact? artifact = null;
         ExternalIdentity? matchedIdentity = null;
 
         if (digestKey is not null)
@@ -496,10 +501,17 @@ internal sealed class EntityResolver(TracebackDbContext db)
 
     private async Task EnsureAliasAsync(BuildArtifact artifact, string aliasKey, string provider, DateTimeOffset observedAt, CancellationToken ct)
     {
-        var exists = await db.ExternalIdentities.AnyAsync(
+        // A prior descriptor in this batch may have queued the same identity
+        // without flushing it yet. Check tracked rows before querying the
+        // database so cache-hit merges remain idempotent within the batch.
+        var exists = db.ExternalIdentities.Local.Any(
             i => i.Provider == provider &&
                  i.EntityTypeName == ExternalEntityTypes.BuildArtifact &&
-                 i.ExternalKey == aliasKey, ct);
+                 i.ExternalKey == aliasKey) ||
+            await db.ExternalIdentities.AnyAsync(
+                i => i.Provider == provider &&
+                     i.EntityTypeName == ExternalEntityTypes.BuildArtifact &&
+                     i.ExternalKey == aliasKey, ct);
         if (exists)
             return;
         var identity = new ExternalIdentity

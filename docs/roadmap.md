@@ -18,7 +18,9 @@ Delivered:
 - commits with author/committer identity, message and canonical URL;
 - Actions runs keyed by `(repository, run id, attempt)`, so a rerun adds an
   attempt instead of rewriting the previous one;
-- Actions artifacts as `BuildArtifact` rows linked to the run that produced them;
+- Actions artifacts as `BuildArtifact` rows with provider evidence, linked to a
+  run only when one attempt is known (the logical-run association remains
+  unresolved for reruns);
 - incremental synchronization with per-stream checkpoints in `sync_states`,
   a deliberate overlap window, and checkpoint advance only after durable
   ingestion;
