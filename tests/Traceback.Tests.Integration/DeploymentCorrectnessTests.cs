@@ -31,6 +31,12 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         var history = await app.Client.GetJsonAsync(
             "/api/services/checkout/environments/staging/deployments?from=2026-08-20T00:00:00Z&to=2026-08-21T00:00:00Z");
         Assert.Equal(2, history.GetProperty("deployments").GetArrayLength());
+        foreach (var entry in history.GetProperty("deployments").EnumerateArray())
+        {
+            var source = Assert.Single(entry.GetProperty("deployment").GetProperty("sources").EnumerateArray());
+            Assert.Equal("docker", source.GetProperty("provider").GetString());
+            Assert.Equal("checkout/staging", source.GetProperty("externalKey").GetString());
+        }
     }
 
     [Theory]
@@ -154,6 +160,8 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
 
         await app.IngestAsync([Deployment("docker", "checkout/legacy-terminal", Artifact, DeploymentOutcome.Succeeded,
             deployedAt, deployedAt, deployedAt.AddMinutes(1))]);
+        // Simulate a row created before DeploymentLifecycleFreshness: the
+        // additive migration leaves its source-state watermark null.
         await ExecuteAsync(app, "UPDATE deployments SET provider_state_at = NULL");
 
         await app.IngestAsync([Deployment("docker", "checkout/legacy-terminal", Artifact, DeploymentOutcome.Failed,
@@ -263,7 +271,7 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
             Deployment("docker", "checkout/deployment-no-artifact-edge", Artifact, DeploymentOutcome.Succeeded,
                 deployedAt, deployedAt, deployedAt.AddMinutes(1),
                 new ExternalRef("github", "workflow_run", runKey)),
-            WorkflowRun(runKey, commitSha, Artifact, deployedAt.AddMinutes(-2), deployedAt, 42, []),
+            WorkflowRun(runKey, commitSha, Artifact, deployedAt.AddMinutes(-2), deployedAt, 42, [], "checkout"),
         ]);
 
         Assert.Equal(0, await CountAsync(app, "workflow_run_artifacts"));
@@ -303,7 +311,8 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         DateTimeOffset startedAt,
         DateTimeOffset completedAt,
         long runNumber,
-        IReadOnlyList<ArtifactDescriptor>? producedArtifacts = null) =>
+        IReadOnlyList<ArtifactDescriptor>? producedArtifacts = null,
+        string? repository = null) =>
         new(
             new EventProvenance("github", "workflow_run", externalName, null, completedAt, completedAt.AddMinutes(2)),
             externalName,
@@ -315,6 +324,7 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
             completedAt,
             commitSha,
             producedArtifacts ?? [artifact],
+            Repository: repository,
             UpdatedAt: completedAt);
 
     private static async Task<int> CountAsync(TracebackApp app, string table)

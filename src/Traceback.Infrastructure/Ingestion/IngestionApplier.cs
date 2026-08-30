@@ -245,7 +245,7 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
                 EnvironmentId = environment.Id,
                 DeployedAt = e.DeployedAt,
                 Status = MapStatus(e.Outcome),
-                ProviderStateAt = stateUpdatedAt,
+                ProviderStateAt = e.Outcome is null ? null : stateUpdatedAt,
                 WorkflowRunId = workflowRunId,
                 CreatedByProvider = e.Provenance.Provider,
                 FirstObservedAt = e.Provenance.ObservedAt,
@@ -260,10 +260,13 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
         {
             EntityResolver.MarkObserved(deployment, e.Provenance.ObservedAt);
 
-            if (StateFreshnessPolicy.CanApplyScalars(deployment.ProviderStateAt, stateUpdatedAt))
+            // Null outcomes carry no status fact and therefore must not move
+            // the status watermark. The deployment creator is the canonical
+            // status owner; independent provider clocks are evidence only.
+            if (e.Outcome is not null
+                && CanApplyDeploymentOutcome(deployment, e.Provenance.Provider, stateUpdatedAt))
             {
-                if (e.Outcome is not null)
-                    deployment.Status = MapStatus(e.Outcome);
+                deployment.Status = MapStatus(e.Outcome);
                 deployment.ProviderStateAt = StateFreshnessPolicy.Merge(
                     deployment.ProviderStateAt ?? DateTimeOffset.MinValue, stateUpdatedAt);
             }
@@ -273,12 +276,35 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
             deployment.WorkflowRunId ??= workflowRunId;
         }
 
+        // Preserve the provider's actual deployment key on the append-only
+        // observation. It may be reused across rollouts, so it cannot serve as
+        // the unique entity identity on external_identities.
+        observation.DeploymentId = deployment.Id;
+
         await EnsureDeploymentIdentityAsync(
             e.Provenance.Provider,
             BuildDeploymentKey(service.Name, environment.Name, artifact, e.DeployedAt),
             deployment,
             e.Provenance.ObservedAt,
             ct);
+    }
+
+    private static bool CanApplyDeploymentOutcome(
+        Deployment deployment,
+        string provider,
+        DateTimeOffset? stateUpdatedAt)
+    {
+        if (!string.Equals(provider, deployment.CreatedByProvider, StringComparison.Ordinal))
+            return false;
+
+        // A legacy terminal row has no trustworthy source watermark. Preserve
+        // its terminal state until a future migration can establish one from a
+        // durable provider fact; same-status observations need no projection.
+        if (deployment.ProviderStateAt is null
+            && deployment.Status is DeploymentStatus.Succeeded or DeploymentStatus.Failed)
+            return false;
+
+        return StateFreshnessPolicy.CanApplyScalars(deployment.ProviderStateAt, stateUpdatedAt);
     }
 
     private async Task ApplyAsync(ServiceObserved e, CancellationToken ct)
@@ -430,6 +456,9 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
             identity.LastObservedAt = observedAt;
     }
 
+    // This is an internal rollout identity, not the provider's external key.
+    // The raw key stays on Observation.DeploymentId evidence because providers
+    // may reuse it for later rollouts.
     internal static string BuildDeploymentKey(
         string serviceName,
         string environmentName,

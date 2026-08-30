@@ -45,6 +45,8 @@ internal sealed class EvidenceLoadResult
         new Dictionary<Guid, List<ExternalIdentity>>();
     public IReadOnlyDictionary<Guid, List<ExternalIdentity>> Deployments { get; init; } =
         new Dictionary<Guid, List<ExternalIdentity>>();
+    public IReadOnlyDictionary<Guid, List<SourceEvidence>> DeploymentObservations { get; init; } =
+        new Dictionary<Guid, List<SourceEvidence>>();
 
     public static readonly EvidenceLoadResult Empty = new();
 }
@@ -71,6 +73,7 @@ internal static class EvidenceLoader
             WorkflowRuns = await Load(db, x => x.WorkflowRunId, workflowRunIds, cancellationToken),
             BuildArtifacts = await Load(db, x => x.BuildArtifactId, buildArtifactIds, cancellationToken),
             Deployments = await Load(db, x => x.DeploymentId, deploymentIds, cancellationToken),
+            DeploymentObservations = await LoadDeploymentObservations(db, deploymentIds, cancellationToken),
         };
     }
 
@@ -98,6 +101,38 @@ internal static class EvidenceLoader
                     .ThenBy(i => i.ExternalKey, StringComparer.Ordinal)
                     .ToList());
         return grouped;
+    }
+
+    private static async Task<IReadOnlyDictionary<Guid, List<SourceEvidence>>> LoadDeploymentObservations(
+        TracebackDbContext db,
+        IReadOnlyCollection<Guid>? ids,
+        CancellationToken ct)
+    {
+        if (ids is not { Count: > 0 })
+            return new Dictionary<Guid, List<SourceEvidence>>();
+
+        var idList = ids.Distinct().ToList();
+        var rows = await db.Observations.AsNoTracking()
+            .Where(o => o.EntityTypeName == ExternalEntityTypes.Deployment
+                        && o.DeploymentId != null
+                        && idList.Contains(o.DeploymentId.Value))
+            .ToListAsync(ct);
+
+        return rows
+            .GroupBy(o => o.DeploymentId!.Value)
+            .ToDictionary(
+                deployment => deployment.Key,
+                deployment => deployment
+                    .GroupBy(o => (o.Provider, o.ExternalKey))
+                    .OrderBy(source => source.Key.Provider, StringComparer.Ordinal)
+                    .ThenBy(source => source.Key.ExternalKey, StringComparer.Ordinal)
+                    .Select(source => new SourceEvidence(
+                        source.Key.Provider,
+                        source.Key.ExternalKey,
+                        null,
+                        source.Min(o => o.ObservedAt),
+                        source.Max(o => o.ObservedAt)))
+                    .ToList());
     }
 
     private static System.Linq.Expressions.Expression<Func<ExternalIdentity, bool>> ExpressionPredicate(
@@ -181,8 +216,19 @@ internal static class ResultMappers
         ServiceName = d.Service.Name,
         EnvironmentName = d.Environment.Name,
         IsPlaceholder = d.IsPlaceholder,
-        Sources = Sources(d.Id, null, evd.Deployments),
+        Sources = DeploymentSources(d.Id, evd),
     };
+
+    private static List<SourceEvidence> DeploymentSources(Guid deploymentId, EvidenceLoadResult evd)
+    {
+        // New observations retain the provider's raw key and are authoritative
+        // for API evidence. Synthetic ExternalIdentity keys remain a fallback
+        // for deployments created before the observation link was introduced.
+        if (evd.DeploymentObservations.TryGetValue(deploymentId, out var observations)
+            && observations.Count > 0)
+            return observations;
+        return Sources(deploymentId, null, evd.Deployments);
+    }
 
     private static List<SourceEvidence> Sources(
         Guid entityId, string? url, IReadOnlyDictionary<Guid, List<ExternalIdentity>> map)

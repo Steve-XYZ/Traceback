@@ -29,8 +29,8 @@ public sealed class Deployment : IExternallySourced
 
     /// <summary>
     /// Freshest provider timestamp projected onto this deployment. Lifecycle
-    /// observations use it to prevent a late older status from regressing a
-    /// newer terminal state; see StateFreshnessPolicy.
+    /// observations from the creating provider use it to prevent a late older
+    /// status from regressing a newer terminal state; see StateFreshnessPolicy.
     /// </summary>
     public DateTimeOffset? ProviderStateAt { get; set; }
 

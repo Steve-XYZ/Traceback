@@ -70,7 +70,7 @@ internal sealed class WorkItemQueries(TracebackDbContext db) : IWorkItemQueries
 
         var runIds = runsByCommit.Select(r => r.Id).ToList();
 
-        var artifactsByRun = runIds.Count == 0
+        var artifactLinkRows = runIds.Count == 0
             ? []
             : await (
                     from j in db.WorkflowRunArtifacts.AsNoTracking()
@@ -80,7 +80,44 @@ internal sealed class WorkItemQueries(TracebackDbContext db) : IWorkItemQueries
                     select new { j.WorkflowRunId, Artifact = a })
                 .ToListAsync(ct);
 
-        var artifactIds = artifactsByRun.Select(x => x.Artifact.Id).Distinct().ToList();
+        // A deployment may explicitly name the run that produced it even when
+        // the connector could not establish a WorkflowRunArtifact edge. Keep
+        // that provider-stated pair in the chain as an evidence-backed link.
+        var explicitDeploymentLinks = runIds.Count == 0
+            ? []
+            : await db.Deployments.AsNoTracking()
+                .Where(d => d.WorkflowRunId != null && runIds.Contains(d.WorkflowRunId.Value))
+                .Select(d => new { WorkflowRunId = d.WorkflowRunId!.Value, d.ArtifactId })
+                .Distinct()
+                .ToListAsync(ct);
+
+        var artifactIds = artifactLinkRows.Select(x => x.Artifact.Id)
+            .Concat(explicitDeploymentLinks.Select(x => x.ArtifactId))
+            .Distinct()
+            .ToList();
+
+        var artifactsById = artifactLinkRows
+            .Select(x => x.Artifact)
+            .DistinctBy(a => a.Id)
+            .ToDictionary(a => a.Id);
+        var missingArtifactIds = artifactIds.Where(id => !artifactsById.ContainsKey(id)).ToList();
+        if (missingArtifactIds.Count > 0)
+        {
+            var missingArtifacts = await db.BuildArtifacts.AsNoTracking()
+                .Where(a => missingArtifactIds.Contains(a.Id))
+                .ToListAsync(ct);
+            foreach (var artifact in missingArtifacts)
+                artifactsById[artifact.Id] = artifact;
+        }
+
+        var artifactsByRun = artifactLinkRows
+            .Select(x => (x.WorkflowRunId, x.Artifact))
+            .ToList();
+        foreach (var link in explicitDeploymentLinks)
+        {
+            if (!artifactsByRun.Any(x => x.WorkflowRunId == link.WorkflowRunId && x.Artifact.Id == link.ArtifactId))
+                artifactsByRun.Add((link.WorkflowRunId, artifactsById[link.ArtifactId]));
+        }
 
         var deployments = artifactIds.Count == 0
             ? []
