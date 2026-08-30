@@ -86,9 +86,18 @@ internal sealed class ObservationConfiguration : IEntityTypeConfiguration<Observ
 
         b.HasIndex(x => x.Fingerprint).IsUnique();
         b.HasIndex(x => new { x.EntityTypeName, x.ExternalKey });
+        b.HasIndex(x => x.DeploymentId);
         b.HasIndex(x => x.ObservedAt);
 
         b.Property(x => x.PayloadJson).HasColumnType("jsonb");
+
+        // Deployment observations retain the provider's raw external key while
+        // pointing at the resolved natural deployment. SetNull keeps the
+        // append-only evidence log intact if a deployment is ever removed.
+        b.HasOne(x => x.Deployment)
+            .WithMany()
+            .HasForeignKey(x => x.DeploymentId)
+            .OnDelete(DeleteBehavior.SetNull);
     }
 }
 

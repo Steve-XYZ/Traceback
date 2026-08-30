@@ -218,6 +218,11 @@ Two layers:
    natural key — unique `(artifact_id, service_id, environment_id, deployed_at)`
    — so two providers reporting the same rollout converge on one fact.
 
+Deployment observations retain the provider's raw external key on the resolved
+deployment separately from the synthetic rollout identity, so a provider key
+reused for a later rollout remains visible on both observations without
+remapping either deployment.
+
 Re-ingesting an entire scenario is therefore always safe, which is why the API
 container re-runs fixture seeding on every start without duplicating anything.
 
@@ -272,6 +277,9 @@ Arrival order is not a fact about the world. Provider state timestamps are.
 - events with no state timestamp apply as before. A connector that cannot know
   its freshness opts out explicitly rather than having a timestamp invented for
   it;
+- deployment lifecycle status is owned by the provider that created the
+  deployment row. Other providers' deployment outcomes remain evidence only:
+  their clocks are independent and cannot safely overwrite the canonical status;
 - commits are exempt: a commit object is immutable content, so there is nothing
   to lose a race over.
 
