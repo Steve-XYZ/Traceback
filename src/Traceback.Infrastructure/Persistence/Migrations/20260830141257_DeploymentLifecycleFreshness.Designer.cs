@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using Traceback.Infrastructure.Persistence;
@@ -11,9 +12,11 @@ using Traceback.Infrastructure.Persistence;
 namespace Traceback.Infrastructure.Persistence.Migrations
 {
     [DbContext(typeof(TracebackDbContext))]
-    partial class TracebackDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260830141257_DeploymentLifecycleFreshness")]
+    partial class DeploymentLifecycleFreshness
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

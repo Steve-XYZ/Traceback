@@ -2,8 +2,8 @@ namespace Traceback.Domain.Entities;
 
 /// <summary>
 /// The fact that a specific artifact was deployed to a service in an environment.
-/// Immutable once written; corrections arrive as new observations of the same fact
-/// (matched by natural key) or as new deployments.
+/// The natural key identifies one rollout, while its provider-reported lifecycle
+/// status may advance as newer observations of that rollout arrive.
 /// </summary>
 public sealed class Deployment : IExternallySourced
 {
@@ -26,6 +26,13 @@ public sealed class Deployment : IExternallySourced
     public DateTimeOffset DeployedAt { get; set; }
 
     public DeploymentStatus Status { get; set; } = DeploymentStatus.Unknown;
+
+    /// <summary>
+    /// Freshest provider timestamp projected onto this deployment. Lifecycle
+    /// observations use it to prevent a late older status from regressing a
+    /// newer terminal state; see StateFreshnessPolicy.
+    /// </summary>
+    public DateTimeOffset? ProviderStateAt { get; set; }
 
     /// <summary>Workflow run that produced the artifact, when the source knows it.</summary>
     public Guid? WorkflowRunId { get; set; }

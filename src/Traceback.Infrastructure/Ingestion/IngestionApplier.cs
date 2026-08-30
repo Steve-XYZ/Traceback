@@ -31,6 +31,7 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
 
     private readonly HashSet<string> _knownEdges = [];
     private readonly Dictionary<string, Deployment> _knownDeployments = [];
+    private readonly Dictionary<(string Provider, string ExternalKey), ExternalIdentity> _knownDeploymentIdentities = [];
 
     public async Task ApplyAsync(TracebackEvent evt, CancellationToken ct)
     {
@@ -223,7 +224,8 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
         }
 
         var observation = CurrentObservation ?? throw new InvalidOperationException("No active observation.");
-        var deploymentKey = $"{artifact.Id}|{service.Id}|{environment.Id}|{e.DeployedAt:o}";
+        var stateUpdatedAt = ((IStateFreshness)e).StateUpdatedAt;
+        var deploymentKey = $"{artifact.Id}|{service.Id}|{environment.Id}|{e.DeployedAt.UtcTicks}";
         // Memo-first: deployments created earlier in this batch may not be
         // flushed yet, so a plain database query would miss them.
         var deployment = _knownDeployments.TryGetValue(deploymentKey, out var tracked)
@@ -243,6 +245,7 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
                 EnvironmentId = environment.Id,
                 DeployedAt = e.DeployedAt,
                 Status = MapStatus(e.Outcome),
+                ProviderStateAt = stateUpdatedAt,
                 WorkflowRunId = workflowRunId,
                 CreatedByProvider = e.Provenance.Provider,
                 FirstObservedAt = e.Provenance.ObservedAt,
@@ -252,25 +255,30 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
             await db.Deployments.AddAsync(deployment, ct);
             PendingDeployments.Add((deployment, observation));
             _knownDeployments.Add(deploymentKey, deployment);
-
-            var identity = new ExternalIdentity
-            {
-                Provider = e.Provenance.Provider,
-                EntityTypeName = ExternalEntityTypes.Deployment,
-                ExternalKey = BuildDeploymentKey(service.Name, environment.Name, artifact),
-                FirstObservedAt = e.Provenance.ObservedAt,
-                LastObservedAt = e.Provenance.ObservedAt,
-                DeploymentId = deployment.Id,
-            };
-            await db.ExternalIdentities.AddAsync(identity, ct);
         }
         else
         {
             EntityResolver.MarkObserved(deployment, e.Provenance.ObservedAt);
-            if (e.Outcome is not null && deployment.Status == DeploymentStatus.Unknown)
-                deployment.Status = MapStatus(e.Outcome);
+
+            if (StateFreshnessPolicy.CanApplyScalars(deployment.ProviderStateAt, stateUpdatedAt))
+            {
+                if (e.Outcome is not null)
+                    deployment.Status = MapStatus(e.Outcome);
+                deployment.ProviderStateAt = StateFreshnessPolicy.Merge(
+                    deployment.ProviderStateAt ?? DateTimeOffset.MinValue, stateUpdatedAt);
+            }
+
+            // A provider-stated run link is additive evidence. Keep the first
+            // explicit link and allow a later observation to fill a missing one.
             deployment.WorkflowRunId ??= workflowRunId;
         }
+
+        await EnsureDeploymentIdentityAsync(
+            e.Provenance.Provider,
+            BuildDeploymentKey(service.Name, environment.Name, artifact, e.DeployedAt),
+            deployment,
+            e.Provenance.ObservedAt,
+            ct);
     }
 
     private async Task ApplyAsync(ServiceObserved e, CancellationToken ct)
@@ -360,8 +368,74 @@ internal sealed class IngestionApplier(TracebackDbContext db, EntityResolver res
         _knownEdges.Add(edgeKey);
     }
 
-    internal static string BuildDeploymentKey(string serviceName, string environmentName, BuildArtifact artifact) =>
-        $"deployments/{serviceName}/{environmentName}/{artifact.CanonicalKey}/{artifact.Version ?? "unversioned"}";
+    private async Task EnsureDeploymentIdentityAsync(
+        string provider,
+        string externalKey,
+        Deployment deployment,
+        DateTimeOffset observedAt,
+        CancellationToken ct)
+    {
+        var cacheKey = (provider, externalKey);
+        if (_knownDeploymentIdentities.TryGetValue(cacheKey, out var known))
+        {
+            TouchIdentity(known, observedAt);
+            return;
+        }
+
+        var identity = await db.ExternalIdentities.FirstOrDefaultAsync(
+            i => i.Provider == provider
+                && i.EntityTypeName == ExternalEntityTypes.Deployment
+                && i.ExternalKey == externalKey,
+            ct);
+
+        if (identity is null)
+        {
+            identity = db.ChangeTracker.Entries<ExternalIdentity>()
+                .FirstOrDefault(entry => entry.State != EntityState.Deleted
+                    && entry.Entity.Provider == provider
+                    && entry.Entity.EntityTypeName == ExternalEntityTypes.Deployment
+                    && entry.Entity.ExternalKey == externalKey)
+                ?.Entity;
+        }
+
+        if (identity is null)
+        {
+            identity = new ExternalIdentity
+            {
+                Provider = provider,
+                EntityTypeName = ExternalEntityTypes.Deployment,
+                ExternalKey = externalKey,
+                FirstObservedAt = observedAt,
+                LastObservedAt = observedAt,
+                DeploymentId = deployment.Id,
+            };
+            await db.ExternalIdentities.AddAsync(identity, ct);
+        }
+        else
+        {
+            if (identity.DeploymentId is { } existingId && existingId != deployment.Id)
+                throw new InvalidOperationException($"Deployment identity '{provider}/{externalKey}' maps to multiple deployments.");
+            identity.DeploymentId = deployment.Id;
+            TouchIdentity(identity, observedAt);
+        }
+
+        _knownDeploymentIdentities[cacheKey] = identity;
+    }
+
+    private static void TouchIdentity(ExternalIdentity identity, DateTimeOffset observedAt)
+    {
+        if (observedAt < identity.FirstObservedAt)
+            identity.FirstObservedAt = observedAt;
+        if (observedAt > identity.LastObservedAt)
+            identity.LastObservedAt = observedAt;
+    }
+
+    internal static string BuildDeploymentKey(
+        string serviceName,
+        string environmentName,
+        BuildArtifact artifact,
+        DateTimeOffset deployedAt) =>
+        $"deployments/{serviceName}/{environmentName}/{artifact.CanonicalKey}/{deployedAt.UtcDateTime:O}";
 
     internal static DeploymentStatus MapStatus(DeploymentOutcome? outcome)
     {

@@ -28,8 +28,8 @@ internal sealed class EntityResolver(TracebackDbContext db)
     private readonly Dictionary<(string Provider, string EntityType, string Key), object> _entityCache = [];
     private readonly Dictionary<string, Engineer> _engineerCache = [];
     private readonly Dictionary<string, BuildArtifact> _artifactCache = [];
-    private readonly Dictionary<(string Provider, string Name), Service> _serviceCache = [];
-    private readonly Dictionary<(string Provider, string Name), DeploymentEnvironment> _environmentCache = [];
+    private readonly Dictionary<string, Service> _serviceCache = [];
+    private readonly Dictionary<string, DeploymentEnvironment> _environmentCache = [];
 
     public async Task<SourceRepository> ResolveRepositoryAsync(string provider, string key, DateTimeOffset observedAt, CancellationToken ct)
     {
@@ -273,7 +273,12 @@ internal sealed class EntityResolver(TracebackDbContext db)
         foreach (var key in new[] { digestKey, externalKey, versionKey })
         {
             if (key is not null && _artifactCache.TryGetValue(key, out var cachedArtifact))
+            {
+                foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
+                    await EnsureAliasAsync(cachedArtifact, alias!, provider, observedAt, ct);
+                Touch(cachedArtifact, observedAt);
                 return cachedArtifact;
+            }
         }
 
         BuildArtifact? artifact = null;
@@ -302,8 +307,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
             // Register any newly-learned aliases against the same artifact.
             foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
             {
-                if (alias != artifact.CanonicalKey)
-                    await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
+                await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
                 _artifactCache.TryAdd(alias!, artifact);
             }
             Touch(artifact, observedAt);
@@ -327,8 +331,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
         await db.BuildArtifacts.AddAsync(artifact, ct);
         foreach (var alias in new[] { digestKey, externalKey, versionKey }.Where(k => k is not null))
         {
-            if (alias != canonical)
-                await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
+            await EnsureAliasAsync(artifact, alias!, provider, observedAt, ct);
             _artifactCache[alias!] = artifact;
         }
         return artifact;
@@ -337,9 +340,13 @@ internal sealed class EntityResolver(TracebackDbContext db)
     public async Task<Service> ResolveServiceAsync(string provider, string rawName, DateTimeOffset observedAt, CancellationToken ct)
     {
         var name = NormalizeName(rawName);
-        var cacheKey = (provider, name);
+        var cacheKey = name;
         if (_serviceCache.TryGetValue(cacheKey, out var cachedService))
+        {
+            await EnsureIdentityForNaturalKeyAsync(ExternalEntityTypes.Service, provider, name, cachedService.Id, observedAt,
+                (i, id) => i.ServiceId = id, ct);
             return cachedService;
+        }
 
         var existing = await db.Services.FirstOrDefaultAsync(s => s.Name == name, ct);
         Service service;
@@ -362,9 +369,13 @@ internal sealed class EntityResolver(TracebackDbContext db)
     public async Task<DeploymentEnvironment> ResolveEnvironmentAsync(string provider, string rawName, DateTimeOffset observedAt, CancellationToken ct)
     {
         var name = NormalizeName(rawName);
-        var cacheKey = (provider, name);
+        var cacheKey = name;
         if (_environmentCache.TryGetValue(cacheKey, out var cachedEnvironment))
+        {
+            await EnsureIdentityForNaturalKeyAsync(ExternalEntityTypes.Environment, provider, name, cachedEnvironment.Id, observedAt,
+                (i, id) => i.EnvironmentId = id, ct);
             return cachedEnvironment;
+        }
 
         var existing = await db.Environments.FirstOrDefaultAsync(e => e.Name == name, ct);
         DeploymentEnvironment env;
@@ -486,16 +497,34 @@ internal sealed class EntityResolver(TracebackDbContext db)
         Action<ExternalIdentity, Guid> assign,
         CancellationToken ct)
     {
-        var exists = await db.ExternalIdentities.AnyAsync(
-            i => i.Provider == provider && i.EntityTypeName == entityType && i.ExternalKey == key, ct);
+        var exists = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Any(entry => entry.State != EntityState.Deleted
+                && entry.Entity.Provider == provider
+                && entry.Entity.EntityTypeName == entityType
+                && entry.Entity.ExternalKey == key);
+        if (!exists)
+        {
+            exists = await db.ExternalIdentities.AnyAsync(
+                i => i.Provider == provider && i.EntityTypeName == entityType && i.ExternalKey == key, ct);
+        }
         if (!exists)
             await AttachNewIdentityAsync(entityType, provider, key, entityId, observedAt, assign, ct);
     }
 
     private async Task EnsureAliasAsync(BuildArtifact artifact, string aliasKey, string provider, DateTimeOffset observedAt, CancellationToken ct)
     {
-        var exists = await db.ExternalIdentities.AnyAsync(
-            i => i.EntityTypeName == ExternalEntityTypes.BuildArtifact && i.ExternalKey == aliasKey, ct);
+        var exists = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Any(entry => entry.State != EntityState.Deleted
+                && entry.Entity.Provider == provider
+                && entry.Entity.EntityTypeName == ExternalEntityTypes.BuildArtifact
+                && entry.Entity.ExternalKey == aliasKey);
+        if (!exists)
+        {
+            exists = await db.ExternalIdentities.AnyAsync(
+                i => i.Provider == provider
+                    && i.EntityTypeName == ExternalEntityTypes.BuildArtifact
+                    && i.ExternalKey == aliasKey, ct);
+        }
         if (exists)
             return;
         var identity = new ExternalIdentity

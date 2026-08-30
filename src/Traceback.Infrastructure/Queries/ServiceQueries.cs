@@ -134,7 +134,13 @@ internal sealed class ServiceQueries(TracebackDbContext db) : IServiceQueries
             : await db.WorkflowRunArtifacts.AsNoTracking()
                 .Where(j => artifactIds.Contains(j.BuildArtifactId))
                 .ToListAsync(ct);
-        var runIds = runLinks.Select(j => j.WorkflowRunId).Distinct().ToList();
+        var explicitRunIds = entries
+            .Where(deployment => deployment.WorkflowRunId is not null)
+            .Select(deployment => deployment.WorkflowRunId!.Value);
+        var runIds = runLinks.Select(j => j.WorkflowRunId)
+            .Concat(explicitRunIds)
+            .Distinct()
+            .ToList();
 
         var runs = runIds.Count == 0
             ? []
@@ -183,7 +189,10 @@ internal sealed class ServiceQueries(TracebackDbContext db) : IServiceQueries
             var relatedRuns = runLinks
                 .Where(j => j.BuildArtifactId == deployment.ArtifactId)
                 .Select(j => j.WorkflowRunId)
+                .Where(runId => deployment.WorkflowRunId is null || runId == deployment.WorkflowRunId.Value)
                 .ToHashSet();
+            if (deployment.WorkflowRunId is { } explicitRunId && runs.Any(run => run.Id == explicitRunId))
+                relatedRuns = [explicitRunId];
             var relatedCommits = runs.Where(r => relatedRuns.Contains(r.Id))
                 .Select(r => r.CommitId!.Value)
                 .ToHashSet();
@@ -227,21 +236,31 @@ internal sealed class ServiceQueries(TracebackDbContext db) : IServiceQueries
     private sealed record RevisionResolution(WorkflowRun Run);
 
     /// <summary>
-    /// Picks the most recent completed run that produced the artifact and whose
-    /// commit is known. Returns null when the chain cannot be reconstructed yet
-    /// (e.g., deployment observed before its build pipeline).
+    /// Uses the deployment's explicit run link when available. Otherwise picks
+    /// the most recent completed run that produced the artifact and whose commit
+    /// is known. Returns null when the chain cannot be reconstructed yet (e.g.,
+    /// deployment observed before its build pipeline).
     /// </summary>
     private async Task<RevisionResolution?> ResolveRevisionAsync(Deployment current, CancellationToken ct)
     {
-        // Include is not honored through joins/projections, so resolve the run id
-        // first and then load the run with its commit.
-        var runId = await (
-                from j in db.WorkflowRunArtifacts.AsNoTracking()
-                join r in db.WorkflowRuns.AsNoTracking() on j.WorkflowRunId equals r.Id
-                where j.BuildArtifactId == current.ArtifactId && r.CommitId != null
-                orderby r.CompletedAt descending, r.StartedAt descending, r.RunNumber descending
-                select r.Id)
-            .FirstOrDefaultAsync(ct);
+        Guid runId;
+        if (current.WorkflowRunId is { } explicitRunId)
+        {
+            runId = await db.WorkflowRuns.AsNoTracking()
+                .Where(run => run.Id == explicitRunId && run.CommitId != null)
+                .Select(run => run.Id)
+                .FirstOrDefaultAsync(ct);
+        }
+        else
+        {
+            runId = await (
+                    from j in db.WorkflowRunArtifacts.AsNoTracking()
+                    join r in db.WorkflowRuns.AsNoTracking() on j.WorkflowRunId equals r.Id
+                    where j.BuildArtifactId == current.ArtifactId && r.CommitId != null
+                    orderby r.CompletedAt descending, r.StartedAt descending, r.RunNumber descending
+                    select r.Id)
+                .FirstOrDefaultAsync(ct);
+        }
         if (runId == Guid.Empty)
             return null;
 

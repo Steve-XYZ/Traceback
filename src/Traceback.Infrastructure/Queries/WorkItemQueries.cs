@@ -124,7 +124,8 @@ internal sealed class WorkItemQueries(TracebackDbContext db) : IWorkItemQueries
                                 {
                                     Artifact = ResultMappers.ToNode(artifact, evidence),
                                     Deployments = deployments
-                                        .Where(d => d.ArtifactId == artifact.Id)
+                                        .Where(d => d.ArtifactId == artifact.Id
+                                            && (d.WorkflowRunId is null || d.WorkflowRunId == run.Id))
                                         .Select(d => ResultMappers.ToNode(d, evidence))
                                         .ToList(),
                                 })
