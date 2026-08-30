@@ -101,6 +101,26 @@ public sealed class GitHubRestClientBehaviorTests : IDisposable
         Assert.Equal(2, _handler.Requests.Count);
     }
 
+    [Theory]
+    [InlineData(429)]
+    [InlineData(403)]
+    public async Task Repeated_short_rate_limits_fail_after_one_bounded_wait(int status)
+    {
+        var headers = new Dictionary<string, string> { ["Retry-After"] = "0" };
+        if (status == 403)
+        {
+            headers["x-ratelimit-remaining"] = "0";
+            headers["x-ratelimit-reset"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        _handler.Queue(Response(status, headers), Response(status, headers), Response(200));
+
+        var exception = await Assert.ThrowsAsync<GitHubRateLimitException>(
+            () => _client.GetRepositoryAsync("acme", "player-manager"));
+
+        Assert.Contains("single configured wait", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(2, _handler.Requests.Count);
+    }
+
     [Fact]
     public async Task Requests_carry_the_authorization_header_and_user_agent()
     {

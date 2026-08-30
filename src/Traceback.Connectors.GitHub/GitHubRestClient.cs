@@ -16,8 +16,9 @@ namespace Traceback.Connectors.GitHub;
 /// - Authentication and not-found failures fail immediately.
 /// - Rate limits are detected via status plus x-ratelimit-remaining; when the
 ///   reset/retry-after is near, the client waits once inside a bounded window,
-///   otherwise it fails fast with GitHubRateLimitException carrying the reset
-///   time so synchronization can stop deliberately instead of hot-looping.
+///   then fails if the limit persists. Otherwise it fails fast with
+///   GitHubRateLimitException carrying the reset time so synchronization can
+///   stop deliberately instead of hot-looping.
 /// - Requests pin the currently supported GitHub REST API version explicitly.
 /// </summary>
 internal sealed partial class GitHubRestClient(
@@ -165,6 +166,7 @@ internal sealed partial class GitHubRestClient(
     {
         var opts = options.CurrentValue;
         var attempts = 0;
+        var rateLimitWaited = false;
         while (true)
         {
             using var request = BuildRequest(method, pathOrUrl);
@@ -201,14 +203,27 @@ internal sealed partial class GitHubRestClient(
                 {
                     RateLimitEvents.Add(1, new KeyValuePair<string, object?>("host", httpClient.BaseAddress?.Host ?? "api.github.com"));
                     var resetAt = ParseRateLimitReset(response);
-                    var waitSeconds = retryAfter ?? Math.Max(0, (int)Math.Ceiling(((resetAt ?? DateTimeOffset.UtcNow) - DateTimeOffset.UtcNow).TotalSeconds));
-                    if (waitSeconds <= opts.MaxRateLimitWaitSeconds)
+                    var waitSeconds = retryAfter is { } retryAfterSeconds
+                        ? Math.Max(0, retryAfterSeconds)
+                        : Math.Max(0, (int)Math.Ceiling(((resetAt ?? DateTimeOffset.UtcNow) - DateTimeOffset.UtcNow).TotalSeconds));
+                    if (!rateLimitWaited && waitSeconds <= opts.MaxRateLimitWaitSeconds)
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(waitSeconds + 1), ct);
+                        rateLimitWaited = true;
+                        // GitHub's explicit Retry-After is already the complete
+                        // delay. Add a safety second only when deriving the
+                        // delay from an epoch reset header.
+                        var delaySeconds = retryAfter is null
+                            ? Math.Min(waitSeconds + 1, Math.Max(0, opts.MaxRateLimitWaitSeconds))
+                            : waitSeconds;
+                        if (delaySeconds > 0)
+                            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), ct);
                         continue;
                     }
+                    var reason = waitSeconds > opts.MaxRateLimitWaitSeconds
+                        ? $"retry-after {waitSeconds}s exceeds the configured {opts.MaxRateLimitWaitSeconds}s wait window"
+                        : "the rate limit persisted after the single configured wait";
                     throw new GitHubRateLimitException(
-                        $"GitHub rate limit reached; resets at {(resetAt ?? DateTimeOffset.UtcNow):O} (retry-after {waitSeconds}s exceeds the configured {opts.MaxRateLimitWaitSeconds}s wait window).",
+                        $"GitHub rate limit reached; resets at {(resetAt ?? DateTimeOffset.UtcNow):O} ({reason}).",
                         resetAt, retryAfter);
                 }
 

@@ -8,7 +8,8 @@ namespace Traceback.Tests.GitHub;
 /// <summary>
 /// Stream-level synchronization strategy: pagination without truncation,
 /// initial-lookback windows, incremental watermarks, rerun attempt
-/// enumeration, and no-advance-on-truncation.
+/// enumeration, repeatable typed failures on truncation, and consistent
+/// initial cursor reporting.
 /// </summary>
 public sealed class GitHubSyncSourceStrategyTests : IDisposable
 {
@@ -91,17 +92,63 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
         Assert.NotEqual(second.NextCursor, third.NextCursor);
     }
 
-    [Fact]
-    public async Task Page_cap_hit_does_not_advance_the_cursor()
+    [Theory]
+    [InlineData("pull_requests")]
+    [InlineData("commits")]
+    [InlineData("workflow_runs")]
+    public async Task Initial_page_cap_is_a_repeatable_typed_failure_for_every_stream(string resourceType)
     {
         _options.MaxPagesPerFetch = 1;
-        for (var i = 1; i <= 5; i++)
-            AddPullRequest(i, hoursAgo: i); // Three pages at page size 2.
+        SeedPagedStream(resourceType);
 
-        var result = await _source.FetchAsync(Fetch("pull_requests", cursor: null));
+        var first = await Assert.ThrowsAsync<GitHubPageLimitException>(
+            () => _source.FetchAsync(Fetch(resourceType, cursor: null)));
+        var second = await Assert.ThrowsAsync<GitHubPageLimitException>(
+            () => _source.FetchAsync(Fetch(resourceType, cursor: null)));
 
-        // Truncated walk must not produce a watermark that would skip data.
+        Assert.Equal(resourceType, first.ResourceType);
+        Assert.Equal(1, first.MaxPages);
+        Assert.Equal(first.Message, second.Message);
+    }
+
+    [Theory]
+    [InlineData("pull_requests")]
+    [InlineData("commits")]
+    [InlineData("workflow_runs")]
+    public async Task Empty_initial_windows_report_no_cursor_for_every_stream(string resourceType)
+    {
+        var result = await _source.FetchAsync(Fetch(resourceType, cursor: null));
+
         Assert.Null(result.NextCursor);
+    }
+
+    [Fact]
+    public async Task Initial_commit_and_workflow_passes_exclude_overlap_only_items()
+    {
+        var oldSha = "3333333333333333333333333333333333333333";
+        var oldAt = Now.AddDays(-35); // In the incremental overlap, outside the initial window.
+        World.Commits.Add(new FakeCommit
+        {
+            Sha = oldSha,
+            AuthorDate = oldAt,
+            CommitterDate = oldAt,
+        });
+        World.AddRun(new FakeRun
+        {
+            Id = 8301,
+            HeadSha = oldSha,
+            CreatedAt = oldAt,
+            UpdatedAt = oldAt,
+            RunStartedAt = oldAt,
+        });
+
+        var commits = await _source.FetchAsync(Fetch("commits", cursor: null));
+        var workflows = await _source.FetchAsync(Fetch("workflow_runs", cursor: null));
+
+        Assert.Empty(commits.Events.OfType<CommitObserved>());
+        Assert.Null(commits.NextCursor);
+        Assert.Empty(workflows.Events.OfType<WorkflowRunObserved>());
+        Assert.Null(workflows.NextCursor);
     }
 
     [Fact]
@@ -307,6 +354,44 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
                 HeadSha = sha,
             },
             [new FakeCommit { Sha = sha, AuthorDate = updatedAt, CommitterDate = updatedAt }]);
+    }
+
+    private void SeedPagedStream(string resourceType)
+    {
+        switch (resourceType)
+        {
+            case "pull_requests":
+                for (var i = 1; i <= 5; i++)
+                    AddPullRequest(i, hoursAgo: i);
+                break;
+            case "commits":
+                for (var i = 1; i <= 5; i++)
+                {
+                    var sha = $"capcommit{i:d2}".PadRight(40, 'a');
+                    World.Commits.Add(new FakeCommit
+                    {
+                        Sha = sha,
+                        AuthorDate = Now.AddHours(-i),
+                        CommitterDate = Now.AddHours(-i),
+                    });
+                }
+                break;
+            case "workflow_runs":
+                for (var i = 1; i <= 5; i++)
+                {
+                    World.AddRun(new FakeRun
+                    {
+                        Id = 700 + i,
+                        HeadSha = $"caprun{i:d2}".PadRight(40, 'b'),
+                        CreatedAt = Now.AddHours(-i),
+                        UpdatedAt = Now.AddHours(-i),
+                        RunStartedAt = Now.AddHours(-i),
+                    });
+                }
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(resourceType), resourceType, null);
+        }
     }
 
     private sealed class TestHolder(GitHubConnectorOptions options) : GitHubRepositorySyncSource.IOptionsMonitorHolder

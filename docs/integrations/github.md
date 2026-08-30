@@ -129,10 +129,18 @@ The first pass for a repository has no checkpoint, so each stream uses
    attempts of any run whose `run_attempt > 1`, and fetches artifacts for the
    runs in the pass.
 
-Every listing follows the `Link: rel="next"` header until it is absent, so no
-stream stops at the first page. If a stream reaches `MaxPagesPerFetch` first, it
-returns its **previous** cursor: the data fetched so far is committed, the
-checkpoint does not move, and the next pass redoes the window.
+An empty initial stream leaves its cursor null. A cursor is written only after
+the stream observes an in-window provider timestamp and its events are stored.
+
+Each listing follows the `Link: rel="next"` header while it can still return
+items in the stream's lookback window: pull requests stop at the window floor,
+and commits/workflow runs use that floor as their provider-side filter. All
+walks are also subject to `MaxPagesPerFetch`, so a stream can fail before the
+next link is absent. In that case the source reports a
+`GitHubPageLimitException`; the partial batch is not ingested and the
+checkpoint does not move. Repeating the same request with the same cap repeats
+the leading window and fails again. Raise the cap or narrow the requested
+lookback before retrying.
 
 ### Two ways to fetch artifacts
 
@@ -215,9 +223,10 @@ pushing on and advancing later checkpoints past data that was never fetched.
 
 **Rate limits.** A `403` with `x-ratelimit-remaining: 0`, or a `429`, is
 recognized as a rate limit. If the reset (or `Retry-After`) is within
-`MaxRateLimitWaitSeconds`, the client waits once and retries; otherwise it
-throws `GitHubRateLimitException` carrying the reset time, the stream records
-the error and its checkpoint stays put. There is no hot retry loop. Each event
+`MaxRateLimitWaitSeconds`, the client waits once and retries. If the limit
+persists after that wait, or the reset is outside the window, it throws
+`GitHubRateLimitException` carrying the reset time; the stream records the
+error and its checkpoint stays put. There is no hot retry loop. Each event
 increments `traceback.sync.rate_limit_events`.
 
 **Transient errors.** Network failures, timeouts and `408/500/502/503/504` are
@@ -293,7 +302,7 @@ Nothing in GitHub was modified; every request was a `GET`.
 | `GitHub resource does not exist` | the token cannot see the repository, or owner/name are wrong | check the token's repository access list |
 | `GitHub rejected the request (403)` | missing permission (commonly Actions: Read-only) | grant the permission listed above |
 | `GitHub rate limit reached; resets at …` | primary or secondary limit hit | wait for the reset, or raise `MaxRateLimitWaitSeconds` |
-| Stream reports a page cap | the window holds more than `MaxPagesPerFetch × PageSize` objects | run again (the cursor did not move) or raise the cap |
+| Stream reports a page cap | the window holds more than `MaxPagesPerFetch × PageSize` objects | raise the cap or narrow the lookback; repeating with the same cap fails again |
 | Second sync applies observations for unchanged data | the repository genuinely changed, or the fake/real clock moved a timestamp | compare `observationsApplied` per stream in the response |
 
 Per-stream state, including the last sanitized error, is available at
