@@ -171,12 +171,14 @@ public sealed class FakeGitHubApiHandler : HttpMessageHandler
             long.TryParse(artifactRunId, out var artifactRun))
         {
             var artifacts = WorldFor(segments)!.Artifacts.TryGetValue(artifactRun, out var arts) ? arts : [];
+            var pageItems = artifacts.Skip((page - 1) * perPage).Take(perPage).ToList();
+            var hasNext = page * perPage < artifacts.Count;
             var body = JsonSerializer.Serialize(new
             {
                 total_count = artifacts.Count,
-                artifacts = artifacts.Select(a => ArtifactJson(a, runId: null)).ToList(),
+                artifacts = pageItems.Select(a => ArtifactJson(a, runId: null)).ToList(),
             });
-            return Response(200, body);
+            return Response(200, body, HeadersFor(fullPathAndQuery, hasNext, page, perPage));
         }
 
         // GET /repos/{o}/{r}/actions/artifacts (repository-wide; each artifact names its run)

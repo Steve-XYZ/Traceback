@@ -34,9 +34,10 @@ namespace Traceback.Connectors.GitHub;
 ///   attempt, because GitHub scopes artifacts to runs, not attempts.
 ///
 /// A pass never reports success after truncated data: if the page cap is hit
-/// before a stream finishes walking its window, the source throws a typed
-/// failure. The synchronizer then leaves the stream checkpoint and batch
-/// untouched so a retry cannot mistake the capped window for completion.
+/// before a top-level or nested listing finishes walking its window, the source
+/// throws a typed failure. The synchronizer then leaves the stream checkpoint
+/// and batch untouched so a retry cannot mistake the capped window for
+/// completion.
 /// </summary>
 internal sealed class GitHubRepositorySyncSource(
     IGitHubApiClient api,
@@ -155,22 +156,28 @@ internal sealed class GitHubRepositorySyncSource(
     private async Task<List<TracebackEvent>> MapPullRequestWithCommitsAsync(
         string owner, string name, GitHubApiPullRequest pr, GitHubEventMapper mapper, CancellationToken ct)
     {
-        var pageSize = options.Current.PageSize;
+        var opts = options.Current;
+        var pageSize = opts.PageSize;
         var members = new List<GitHubApiCommit>();
 
         using (var fetchSpan = Activity.StartActivity("github.fetch.pull_request_commits"))
         {
             fetchSpan?.SetTag("traceback.github.pull_request", pr.Number);
             string? nextUrl = null;
+            var pagesWalked = 0;
             while (true)
             {
                 var page = await api.GetPullRequestCommitsPageAsync(owner, name, pr.Number, nextUrl, pageSize, notFoundAsEmpty: true, cancellationToken: ct);
-                if (page is not { } current || current.Items.Count == 0)
+                pagesWalked++;
+                fetchSpan?.SetTag("traceback.github.pages", pagesWalked);
+                if (page.Items.Count == 0)
                     break;
-                members.AddRange(current.Items);
-                if (!current.HasNext)
+                members.AddRange(page.Items);
+                if (!page.HasNext)
                     break;
-                nextUrl = current.NextUrl;
+                if (pagesWalked >= opts.MaxPagesPerFetch)
+                    throw new GitHubPageLimitException("pull_request_commits", pagesWalked, opts.MaxPagesPerFetch);
+                nextUrl = page.NextUrl;
             }
             fetchSpan?.SetTag("traceback.github.commits", members.Count);
         }
@@ -373,7 +380,7 @@ internal sealed class GitHubRepositorySyncSource(
                     if (!page.HasNext)
                         break;
                     if (walked >= opts.MaxPagesPerFetch)
-                        throw new GitHubPageLimitException("workflow_runs", walked, opts.MaxPagesPerFetch);
+                        throw new GitHubPageLimitException("workflow_run_artifacts", walked, opts.MaxPagesPerFetch);
                     page = await api.GetRepositoryArtifactsPageAsync(owner, name, page.NextUrl, opts.PageSize, notFoundAsEmpty: true, cancellationToken: ct);
                     walked++;
                 }
@@ -383,13 +390,30 @@ internal sealed class GitHubRepositorySyncSource(
         }
 
         span?.SetTag("traceback.github.artifact_strategy", "per_run");
+        var artifactRequests = 0;
         foreach (var runId in runIds)
         {
-            var artifacts = await api.GetRunArtifactsAsync(owner, name, runId, notFoundAsEmpty: true, cancellationToken: ct);
+            var artifacts = new List<GitHubApiArtifact>();
+            string? nextUrl = null;
+            var pagesWalked = 0;
+            while (true)
+            {
+                var page = await api.GetRunArtifactsPageAsync(owner, name, runId, nextUrl, opts.PageSize, notFoundAsEmpty: true, cancellationToken: ct);
+                pagesWalked++;
+                artifactRequests++;
+                span?.SetTag("traceback.github.artifact_requests", artifactRequests);
+                if (page.Items.Count > 0)
+                    artifacts.AddRange(page.Items);
+                if (!page.HasNext)
+                    break;
+                if (pagesWalked >= opts.MaxPagesPerFetch)
+                    throw new GitHubPageLimitException("workflow_run_artifacts", pagesWalked, opts.MaxPagesPerFetch);
+                nextUrl = page.NextUrl;
+            }
             if (artifacts.Count > 0)
-                byRun[runId] = [.. artifacts];
+                byRun[runId] = artifacts;
         }
-        span?.SetTag("traceback.github.artifact_requests", runIds.Count);
+        span?.SetTag("traceback.github.artifact_requests", artifactRequests);
         return byRun;
     }
 }

@@ -40,7 +40,7 @@ Settings bind from the `GitHub` configuration section
 | `GitHub:InitialLookbackDays` | `30` | History depth of a repository's first synchronization. |
 | `GitHub:IncrementalOverlapDays` | `7` | How far behind its watermark each stream re-inspects on later passes. |
 | `GitHub:PageSize` | `100` | `per_page` for every listing request (GitHub's maximum). |
-| `GitHub:MaxPagesPerFetch` | `200` | Safety cap per stream per pass. Hitting it leaves the checkpoint unadvanced. |
+| `GitHub:MaxPagesPerFetch` | `200` | Safety cap per listing walk per pass, including top-level streams and nested PR-commit/per-run artifact walks. Hitting it leaves the affected stream checkpoint unadvanced. |
 | `GitHub:MaxRetries` | `3` | Bounded retries for transient failures. |
 | `GitHub:RetryBackoffSeconds` | `1.0` | Base of the exponential backoff. |
 | `GitHub:MaxRateLimitWaitSeconds` | `120` | Longest in-pipeline wait for a rate-limit reset before failing with the reset time. |
@@ -119,7 +119,7 @@ The first pass for a repository has no checkpoint, so each stream uses
 2. `pull_requests` — walks `pulls?state=all&sort=updated&direction=desc` and
    stops at the first pull request older than the floor. Each pull request
    inside the window also has its commit listing walked; that listing is the
-   authoritative membership evidence.
+   authoritative membership evidence and has its own page cap.
 3. `commits` — walks `commits?since={floor}` over the default branch.
 4. `workflow_runs` — walks `actions/runs?created=>={floor}`, enumerates all
    attempts of any run whose `run_attempt > 1`, and fetches artifacts for the
@@ -130,13 +130,17 @@ the stream observes an in-window provider timestamp and its events are stored.
 
 Each listing follows the `Link: rel="next"` header while it can still return
 items in the stream's lookback window: pull requests stop at the window floor,
-and commits/workflow runs use that floor as their provider-side filter. All
-walks are also subject to `MaxPagesPerFetch`, so a stream can fail before the
-next link is absent. In that case the source reports a
-`GitHubPageLimitException`; the partial batch is not ingested and the
-checkpoint does not move. Repeating the same request with the same cap repeats
-the leading window and fails again. Raise the cap or narrow the requested
-lookback before retrying.
+and commits/workflow runs use that floor as their provider-side filter. Every
+listing walk has its own `MaxPagesPerFetch` budget, including each pull request
+commit listing and each per-run artifact listing. The first page counts once;
+when another page exists at the cap, the source reports a
+`GitHubPageLimitException` before returning the stream batch. The partial batch
+is not ingested and the checkpoint does not move. Repeating the same request
+with the same cap repeats the leading window and fails again because its cursor
+cannot move. Raise the cap, or narrow the requested lookback where that removes
+the oversized work, before retrying. The exception names the affected listing,
+such as `pull_request_commits` or `workflow_run_artifacts`, even when the
+owning stream is `workflow_runs`.
 
 ### Two ways to fetch artifacts
 
@@ -156,6 +160,11 @@ The connector spends one probe request on the repository listing, reads
 per-run otherwise. Both paths produce identical artifact rows and edges; the
 active choice is on the `github.fetch.artifacts` span as
 `traceback.github.artifact_strategy`.
+
+The repository-wide path has one page budget for its listing. When the per-run
+path is selected, every run's artifact listing has an independent budget, so a
+single run with more than `MaxPagesPerFetch × PageSize` artifacts fails the
+workflow-run stream instead of silently dropping the remaining artifacts.
 
 Import the entire repository lifetime by setting a large lookback
 (`GitHub:Repositories:0:InitialLookbackDays: 36500`). That is a deliberate
@@ -295,7 +304,7 @@ Nothing in GitHub was modified; every request was a `GET`.
 | `GitHub resource does not exist` | the token cannot see the repository, or owner/name are wrong | check the token's repository access list |
 | `GitHub rejected the request (403)` | missing permission (commonly Actions: Read-only) | grant the permission listed above |
 | `GitHub rate limit reached; resets at …` | primary or secondary limit hit | wait for the reset, or raise `MaxRateLimitWaitSeconds` |
-| Stream reports a page cap | the window holds more than `MaxPagesPerFetch × PageSize` objects | raise the cap or narrow the lookback; repeating with the same cap fails again |
+| Stream or nested listing reports a page cap | a top-level window, PR commit listing, or per-run artifact listing exceeds its page budget | raise the cap; narrow the lookback where it excludes the oversized work; repeating with the same cap fails again because the cursor cannot move |
 | Second sync applies observations for unchanged data | the repository genuinely changed, or the fake/real clock moved a timestamp | compare `observationsApplied` per stream in the response |
 
 Per-stream state, including the last sanitized error, is available at

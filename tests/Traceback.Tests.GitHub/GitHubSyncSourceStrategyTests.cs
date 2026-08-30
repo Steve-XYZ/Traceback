@@ -61,6 +61,37 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
     }
 
     [Fact]
+    public async Task Pull_request_commit_walk_succeeds_at_exact_page_cap()
+    {
+        _options.MaxPagesPerFetch = 2;
+        AddPullRequestWithCommits(42, count: 4);
+
+        var result = await _source.FetchAsync(Fetch("pull_requests", cursor: null));
+
+        var pullRequest = Assert.Single(result.Events.OfType<PullRequestObserved>());
+        Assert.Equal(4, pullRequest.CommitShas.Count);
+        Assert.Equal(2, _handler.RequestLog.Count(path => path.Contains("/pulls/42/commits", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task Pull_request_commit_walk_fails_and_repeats_when_cap_is_exceeded()
+    {
+        _options.MaxPagesPerFetch = 2;
+        AddPullRequestWithCommits(42, count: 5);
+
+        var first = await Assert.ThrowsAsync<GitHubPageLimitException>(
+            () => _source.FetchAsync(Fetch("pull_requests", cursor: null)));
+        var second = await Assert.ThrowsAsync<GitHubPageLimitException>(
+            () => _source.FetchAsync(Fetch("pull_requests", cursor: null)));
+
+        Assert.Equal("pull_request_commits", first.ResourceType);
+        Assert.Equal(2, first.PagesWalked);
+        Assert.Equal(2, first.MaxPages);
+        Assert.Equal(first.Message, second.Message);
+        Assert.Equal(4, _handler.RequestLog.Count(path => path.Contains("/pulls/42/commits", StringComparison.Ordinal)));
+    }
+
+    [Fact]
     public async Task Initial_pass_respects_the_lookback_window()
     {
         AddPullRequest(1, hoursAgo: 2);
@@ -316,6 +347,37 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
         Assert.Contains(_handler.RequestLog, r => r.Contains("/runs/602/artifacts", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task Per_run_artifact_walk_succeeds_at_exact_page_cap()
+    {
+        _options.MaxPagesPerFetch = 2;
+        AddRunWithArtifacts(7001, count: 4);
+
+        var result = await _source.FetchAsync(Fetch("workflow_runs", cursor: null));
+
+        var run = Assert.Single(result.Events.OfType<WorkflowRunObserved>());
+        Assert.Equal(4, run.ProducedArtifacts.Count);
+        Assert.Equal(2, _handler.RequestLog.Count(path => path.Contains("/actions/runs/7001/artifacts", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task Per_run_artifact_walk_fails_and_repeats_when_cap_is_exceeded()
+    {
+        _options.MaxPagesPerFetch = 2;
+        AddRunWithArtifacts(7001, count: 5);
+
+        var first = await Assert.ThrowsAsync<GitHubPageLimitException>(
+            () => _source.FetchAsync(Fetch("workflow_runs", cursor: null)));
+        var second = await Assert.ThrowsAsync<GitHubPageLimitException>(
+            () => _source.FetchAsync(Fetch("workflow_runs", cursor: null)));
+
+        Assert.Equal("workflow_run_artifacts", first.ResourceType);
+        Assert.Equal(2, first.PagesWalked);
+        Assert.Equal(2, first.MaxPages);
+        Assert.Equal(first.Message, second.Message);
+        Assert.Equal(4, _handler.RequestLog.Count(path => path.Contains("/actions/runs/7001/artifacts", StringComparison.Ordinal)));
+    }
+
     private void AddPullRequest(int number, int? daysAgo = null, int? hoursAgo = null)
     {
         var updatedAt = Now - (daysAgo is not null ? TimeSpan.FromDays(daysAgo.Value) : TimeSpan.FromHours(hoursAgo!.Value));
@@ -330,6 +392,46 @@ public sealed class GitHubSyncSourceStrategyTests : IDisposable
                 HeadSha = sha,
             },
             [new FakeCommit { Sha = sha, AuthorDate = updatedAt, CommitterDate = updatedAt }]);
+    }
+
+    private void AddPullRequestWithCommits(int number, int count)
+    {
+        var updatedAt = Now.AddHours(-1);
+        var commits = Enumerable.Range(1, count)
+            .Select(i => new FakeCommit
+            {
+                Sha = $"pr{number:d4}commit{i:d2}".PadRight(40, 'a'),
+                AuthorDate = updatedAt,
+                CommitterDate = updatedAt,
+            })
+            .ToList();
+        World.AddPullRequest(
+            new FakePullRequest
+            {
+                Number = number,
+                Title = $"PR {number}",
+                CreatedAt = updatedAt.AddHours(-1),
+                UpdatedAt = updatedAt,
+                HeadSha = commits[^1].Sha,
+            },
+            commits);
+    }
+
+    private void AddRunWithArtifacts(long runId, int count)
+    {
+        var createdAt = Now.AddHours(-1);
+        World.AddRun(
+            new FakeRun
+            {
+                Id = runId,
+                HeadSha = $"run{runId}sha".PadRight(40, 'b'),
+                CreatedAt = createdAt,
+                UpdatedAt = createdAt,
+                RunStartedAt = createdAt,
+            },
+            Enumerable.Range(1, count)
+                .Select(i => new FakeArtifact { Id = runId * 10 + i, Name = $"drop-{i}" })
+                .ToList());
     }
 
     private void SeedPagedStream(string resourceType)

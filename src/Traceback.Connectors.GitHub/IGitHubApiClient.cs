@@ -21,9 +21,10 @@ public sealed class GitHubRateLimitException(string message, DateTimeOffset? res
 public sealed class GitHubTransientException(string message) : GitHubApiException(message);
 
 /// <summary>
-/// The connector reached its per-stream page safety cap before the provider
-/// listing was complete. The caller must leave the stream checkpoint where it
-/// was and retry after raising the cap (or narrowing the requested window).
+/// The connector reached its per-listing page safety cap before the provider
+/// listing was complete. The caller must leave the owning stream checkpoint
+/// where it was and retry after raising the cap (or narrowing the requested
+/// window).
 /// </summary>
 public sealed class GitHubPageLimitException(string resourceType, int pagesWalked, int maxPages)
     : GitHubApiException($"GitHub {resourceType} fetch stopped after {pagesWalked} pages at the configured MaxPagesPerFetch={maxPages}; the stream was not complete.")
@@ -42,7 +43,7 @@ internal sealed record GitHubArrayPage<T>(IReadOnlyList<T> Items, string? NextUr
 /// <summary>A page whose payload is a wrapper object plus the link-header continuation.</summary>
 internal sealed record GitHubObjectPage<T>(T Payload, string? NextUrl);
 
-/// <summary>Artifacts page plus the repository-wide total the API reports.</summary>
+/// <summary>One artifacts page plus the total the API reports.</summary>
 internal sealed record GitHubArtifactsPage(IReadOnlyList<GitHubApiArtifact> Items, int TotalCount, string? NextUrl)
 {
     public bool HasNext => !string.IsNullOrEmpty(NextUrl);
@@ -72,8 +73,9 @@ internal interface IGitHubApiClient
     Task<IReadOnlyList<GitHubApiWorkflowRun>> GetRunAttemptsAsync(
         string owner, string name, long runId, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default);
 
-    Task<IReadOnlyList<GitHubApiArtifact>> GetRunArtifactsAsync(
-        string owner, string name, long runId, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default);
+    /// <summary>One page of a run's artifacts; the source owns the per-run page budget.</summary>
+    Task<GitHubArtifactsPage> GetRunArtifactsPageAsync(
+        string owner, string name, long runId, string? nextPageUrl, int pageSize, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// One page of the repository-wide artifacts listing. Each artifact names
