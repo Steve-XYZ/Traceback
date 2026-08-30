@@ -141,6 +141,132 @@ public sealed class GitHubPaginationTests(PostgresContainerFixture postgres)
         Assert.NotEqual(string.Empty, await CursorAsync(appB, "pull_requests"));
     }
 
+    [Fact]
+    public async Task Nested_pull_request_commit_cap_is_atomic_and_repeats_until_raised()
+    {
+        var world = GitHubSyncHarness.NewWorld();
+        var updatedAt = TestTimes.Old;
+        var commits = Enumerable.Range(1, 5)
+            .Select(i => new FakeCommit
+            {
+                Sha = $"nested-pr-commit-{i}".PadRight(40, 'a'),
+                AuthorDate = updatedAt,
+                CommitterDate = updatedAt,
+            })
+            .ToList();
+        world.AddPullRequest(
+            new FakePullRequest
+            {
+                Number = 42,
+                Title = "Nested pagination",
+                CreatedAt = updatedAt.AddHours(-1),
+                UpdatedAt = updatedAt,
+                HeadSha = commits[^1].Sha,
+            },
+            commits);
+
+        var capped = new Dictionary<string, string?>(GitHubSyncHarness.DefaultSettings(pageSize: $"{PageSize}"))
+        {
+            ["GitHub:MaxPagesPerFetch"] = "2",
+        };
+        await using var appA = await TracebackApp.StartAsync(
+            postgres.Container,
+            seedFixturesOnStartup: false,
+            configureServices: GitHubSyncHarness.WireFakeTransport(world),
+            settings: capped);
+
+        var firstPass = await GitHubSyncHarness.SyncAsync(appA);
+        Assert.False(firstPass.Success, FailureMessage(firstPass));
+        Assert.StartsWith("pull_requests:", firstPass.Error, StringComparison.Ordinal);
+        Assert.Contains("pull_request_commits", firstPass.Error, StringComparison.Ordinal);
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "pull_requests"));
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "commits"));
+        Assert.Equal(string.Empty, await CursorAsync(appA, "pull_requests"));
+
+        var repeatedPass = await GitHubSyncHarness.SyncAsync(appA);
+        Assert.False(repeatedPass.Success, FailureMessage(repeatedPass));
+        Assert.StartsWith("pull_requests:", repeatedPass.Error, StringComparison.Ordinal);
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "pull_requests"));
+        Assert.Equal(string.Empty, await CursorAsync(appA, "pull_requests"));
+
+        var raised = new Dictionary<string, string?>(GitHubSyncHarness.DefaultSettings(pageSize: $"{PageSize}"))
+        {
+            ["GitHub:MaxPagesPerFetch"] = "3",
+        };
+        await using var appB = await TracebackApp.RestartAgainstSameDatabaseAsync(
+            postgres.Container,
+            appA.DatabaseName,
+            configureServices: GitHubSyncHarness.WireFakeTransport(world),
+            settings: raised);
+
+        var recovered = AssertSynced(await GitHubSyncHarness.SyncAsync(appB));
+        Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(appB, "pull_requests"));
+        Assert.Equal(5, await GitHubSyncHarness.CountRowsAsync(appB, "commits"));
+        Assert.NotEqual(string.Empty, await CursorAsync(appB, "pull_requests"));
+        Assert.True(recovered.TotalObservationsApplied > 0);
+    }
+
+    [Fact]
+    public async Task Per_run_artifact_cap_is_atomic_and_repeats_until_raised()
+    {
+        var world = GitHubSyncHarness.NewWorld();
+        var startedAt = TestTimes.Old;
+        world.AddRun(
+            new FakeRun
+            {
+                Id = 9101,
+                HeadSha = "nested-artifact-run".PadRight(40, 'b'),
+                CreatedAt = startedAt,
+                UpdatedAt = startedAt,
+                RunStartedAt = startedAt,
+            },
+            Enumerable.Range(1, 5)
+                .Select(i => new FakeArtifact { Id = 91010 + i, Name = $"drop-{i}" })
+                .ToList());
+
+        var capped = new Dictionary<string, string?>(GitHubSyncHarness.DefaultSettings(pageSize: $"{PageSize}"))
+        {
+            ["GitHub:MaxPagesPerFetch"] = "2",
+        };
+        await using var appA = await TracebackApp.StartAsync(
+            postgres.Container,
+            seedFixturesOnStartup: false,
+            configureServices: GitHubSyncHarness.WireFakeTransport(world),
+            settings: capped);
+
+        var firstPass = await GitHubSyncHarness.SyncAsync(appA);
+        Assert.False(firstPass.Success, FailureMessage(firstPass));
+        Assert.StartsWith("workflow_runs:", firstPass.Error, StringComparison.Ordinal);
+        Assert.Contains("workflow_run_artifacts", firstPass.Error, StringComparison.Ordinal);
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "workflow_runs"));
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "build_artifacts"));
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "workflow_run_artifacts"));
+        Assert.Equal(string.Empty, await CursorAsync(appA, "workflow_runs"));
+
+        var repeatedPass = await GitHubSyncHarness.SyncAsync(appA);
+        Assert.False(repeatedPass.Success, FailureMessage(repeatedPass));
+        Assert.StartsWith("workflow_runs:", repeatedPass.Error, StringComparison.Ordinal);
+        Assert.Equal(0, await GitHubSyncHarness.CountRowsAsync(appA, "workflow_runs"));
+        Assert.Equal(string.Empty, await CursorAsync(appA, "workflow_runs"));
+
+        var raised = new Dictionary<string, string?>(GitHubSyncHarness.DefaultSettings(pageSize: $"{PageSize}"))
+        {
+            ["GitHub:MaxPagesPerFetch"] = "3",
+        };
+        await using var appB = await TracebackApp.RestartAgainstSameDatabaseAsync(
+            postgres.Container,
+            appA.DatabaseName,
+            configureServices: GitHubSyncHarness.WireFakeTransport(world),
+            settings: raised);
+
+        var recovered = AssertSynced(await GitHubSyncHarness.SyncAsync(appB));
+        Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(appB, "workflow_runs"));
+        Assert.Equal(5, await GitHubSyncHarness.CountRowsAsync(appB, "build_artifacts"));
+        Assert.Equal(5, await GitHubSyncHarness.CountRowsAsync(appB, "workflow_run_artifacts"));
+        Assert.NotEqual(string.Empty, await CursorAsync(appB, "workflow_runs"));
+        Assert.True(recovered.TotalObservationsApplied > 0);
+    }
+
     private async Task<(TracebackApp App, FakeGitHubApiHandler Handler)> StartWithAsync(FakeGitHubRepository world)
     {
         var handler = new FakeGitHubApiHandler { Repository = world };

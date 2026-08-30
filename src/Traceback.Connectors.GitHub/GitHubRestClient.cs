@@ -85,21 +85,14 @@ internal sealed partial class GitHubRestClient(
         return page.Items.OrderBy(a => a.RunAttempt).ToList();
     }
 
-    public async Task<IReadOnlyList<GitHubApiArtifact>> GetRunArtifactsAsync(
-        string owner, string name, long runId, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default)
+    public async Task<GitHubArtifactsPage> GetRunArtifactsPageAsync(
+        string owner, string name, long runId, string? nextPageUrl, int pageSize, bool notFoundAsEmpty = false, CancellationToken cancellationToken = default)
     {
-        var artifacts = new List<GitHubApiArtifact>();
-        var url = $"repos/{owner}/{name}/actions/runs/{runId}/artifacts?per_page={options.CurrentValue.PageSize}";
-        while (url is not null)
-        {
-            var page = await GetObjectPageAsync<GitHubApiArtifactsPage>(url, cancellationToken, notFoundAsEmpty);
-            if (page is null)
-                break;
-            if (page.Payload.Artifacts is { Count: > 0 })
-                artifacts.AddRange(page.Payload.Artifacts);
-            url = page.NextUrl;
-        }
-        return artifacts;
+        var path = nextPageUrl ?? $"repos/{owner}/{name}/actions/runs/{runId}/artifacts?per_page={pageSize}";
+        var page = await GetObjectPageAsync<GitHubApiArtifactsPage>(path, cancellationToken, notFoundAsEmpty);
+        return page is null
+            ? new GitHubArtifactsPage([], 0, null)
+            : new GitHubArtifactsPage(page.Payload.Artifacts ?? [], page.Payload.TotalCount, page.NextUrl);
     }
 
     public async Task<GitHubArtifactsPage> GetRepositoryArtifactsPageAsync(

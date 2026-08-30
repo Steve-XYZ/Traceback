@@ -158,6 +158,35 @@ public sealed class GitHubRestClientBehaviorTests : IDisposable
         Assert.Equal("https://api.github.test/repos/acme/player/pulls?state=all&page=2&per_page=2", next);
     }
 
+    [Fact]
+    public async Task Per_run_artifact_pages_preserve_links_and_treat_not_found_as_empty()
+    {
+        var nextUrl = "https://api.github.test/repos/acme/player-manager/actions/runs/42/artifacts?per_page=2&page=2";
+        var first = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = JsonBody.From(new
+            {
+                total_count = 3,
+                artifacts = new[]
+                {
+                    new { id = 1L, name = "drop-1" },
+                    new { id = 2L, name = "drop-2" },
+                },
+            }),
+        };
+        first.Headers.TryAddWithoutValidation("Link", $"<{nextUrl}>; rel=\"next\"");
+        _handler.Queue(first, Response(404));
+
+        var page = await _client.GetRunArtifactsPageAsync("acme", "player-manager", 42, null, 2, notFoundAsEmpty: true);
+        var empty = await _client.GetRunArtifactsPageAsync("acme", "player-manager", 42, page.NextUrl, 2, notFoundAsEmpty: true);
+
+        Assert.Equal(3, page.TotalCount);
+        Assert.Equal(2, page.Items.Count);
+        Assert.Equal(nextUrl, page.NextUrl);
+        Assert.Empty(empty.Items);
+        Assert.Equal(2, _handler.Requests.Count);
+    }
+
     private static HttpResponseMessage Response(int status, Dictionary<string, string>? headers = null)
     {
         var body = status == 200

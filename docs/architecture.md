@@ -329,7 +329,7 @@ RepositorySynchronizer.SynchronizeAsync("github", …)      # span: github.sync
   for each resource stream, in order:
     ├─ load SyncState(integration_id, resource_type)      # from PostgreSQL
     ├─ source.FetchAsync(cursor, lookback, now)           # span: github.fetch.<stream>
-    │     walks pages until the window floor               # span: traceback.normalize
+    │     walks capped top-level and nested pages           # span: traceback.normalize
     ├─ ingestion.IngestAsync(events)                      # span: traceback.ingest
     │     one transaction; idempotent; appends observations
     └─ advance the cursor  ← only after the ingest commits
@@ -373,12 +373,17 @@ absorbs; pretending an exact cursor exists would cost data. Per-stream cursor
 mechanics are tabulated in
 [integrations/github.md](integrations/github.md#incremental-synchronization).
 
-**Truncation never advances a checkpoint.** Each stream stops after
-`MaxPagesPerFetch` pages. When that cap is hit the source raises a typed page
-limit failure before the batch is ingested. The watermark and data therefore
-stay unchanged, and repeating the same capped request repeats the leading
-window and fails again. Raise the cap or narrow the window before retrying. A
-safety valve cannot silently become a data-loss valve.
+**Truncation never advances a checkpoint.** Each top-level stream, pull-request
+commit listing, and per-run artifact listing has its own `MaxPagesPerFetch`
+budget. The first page counts once; if a next link remains at the cap, the
+source raises a typed page-limit failure before returning that stream's batch.
+The watermark and data therefore stay unchanged, and repeating the same capped
+request repeats the leading window and fails again because the cursor cannot
+move. Raise the cap, or narrow the lookback where it removes the oversized
+work, before retrying. The typed failure names the affected nested listing
+(for example, `pull_request_commits` or `workflow_run_artifacts`) even when
+the owning stream is `pull_requests` or `workflow_runs`. A safety valve cannot
+silently become a data-loss valve.
 
 ## Workflow rerun modeling
 
@@ -410,6 +415,11 @@ Fetching those artifacts has two possible shapes (per run, or one repository-wid
 listing) whose costs differ by orders of magnitude depending on the pass. The
 connector measures rather than assumes; see
 [performance.md](performance.md#one-artifact-request-per-workflow-run-51-on-api-requests).
+The repository-wide listing consumes one page budget; the per-run shape applies
+an independent budget to each run. If a nested walk reaches its cap, raising
+`MaxPagesPerFetch` is the remediation. Narrowing the lookback can reduce the
+number of runs in the pass where applicable, but rerunning with the same cap
+does not make progress because the workflow cursor remains unchanged.
 
 ## Evidence rules: observed, derived, unknown
 
