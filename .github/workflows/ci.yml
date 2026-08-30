@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.400
+
+      - name: Restore
+        run: dotnet restore Traceback.slnx
+
+      - name: Release build
+        run: dotnet build Traceback.slnx --configuration Release --no-restore
+
+      - name: Verify format
+        run: dotnet format Traceback.slnx --verify-no-changes --no-restore
+
+      - name: Run tests
+        run: dotnet test Traceback.slnx --configuration Release --no-build --no-restore
+
+      - name: Restore local tools
+        run: dotnet tool restore
+
+      - name: Check EF model is current
+        run: dotnet ef migrations has-pending-model-changes --project src/Traceback.Infrastructure --startup-project src/Traceback.Api
+
+      - name: Audit vulnerable packages
+        run: dotnet list Traceback.slnx package --vulnerable --include-transitive
+
+      - name: Build benchmark project
+        run: dotnet build tests/Traceback.Benchmark/Traceback.Benchmark.csproj --configuration Release --no-restore
+
+      - name: Build Docker image
+        run: docker build --tag traceback:ci .

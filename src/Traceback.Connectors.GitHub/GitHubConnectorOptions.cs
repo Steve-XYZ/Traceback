@@ -1,5 +1,7 @@
 namespace Traceback.Connectors.GitHub;
 
+using Microsoft.Extensions.Options;
+
 public sealed class GitHubConnectorOptions
 {
     public const string SectionName = "GitHub";
@@ -37,18 +39,70 @@ public sealed class GitHubConnectorOptions
     public List<GitHubRepositoryOptions> Repositories { get; set; } = [];
 
     public GitHubRepositoryOptions? FindRepository(string owner, string name) =>
-        Repositories.FirstOrDefault(r =>
-            r.Owner.Equals(owner.Trim(), StringComparison.OrdinalIgnoreCase) &&
-            r.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase));
+        Repositories?.FirstOrDefault(r =>
+            r is not null &&
+            string.Equals(r.Owner?.Trim(), owner.Trim(), StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(r.Name?.Trim(), name.Trim(), StringComparison.OrdinalIgnoreCase));
 }
 
 public sealed class GitHubRepositoryOptions
 {
-    public required string Owner { get; set; }
-    public required string Name { get; set; }
+    public string? Owner { get; set; }
+    public string? Name { get; set; }
 
     /// <summary>History depth of the first synchronization; defaults to the connector-level setting.</summary>
     public int? InitialLookbackDays { get; set; }
 
-    public string Key => $"{Owner}/{Name}".ToLowerInvariant();
+    public string Key => $"{Owner?.Trim()}/{Name?.Trim()}".ToLowerInvariant();
+}
+
+/// <summary>Validates GitHub connector settings before the host starts.</summary>
+public sealed class GitHubConnectorOptionsValidator : IValidateOptions<GitHubConnectorOptions>
+{
+    public ValidateOptionsResult Validate(string? name, GitHubConnectorOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var failures = new List<string>();
+        if (options.PageSize is < 1 or > 100)
+            failures.Add("GitHub:PageSize must be between 1 and 100.");
+        if (options.MaxPagesPerFetch <= 0)
+            failures.Add("GitHub:MaxPagesPerFetch must be greater than zero.");
+        if (options.InitialLookbackDays < 0)
+            failures.Add("GitHub:InitialLookbackDays must be nonnegative.");
+        if (options.IncrementalOverlapDays < 0)
+            failures.Add("GitHub:IncrementalOverlapDays must be nonnegative.");
+        if (options.MaxRetries < 0)
+            failures.Add("GitHub:MaxRetries must be nonnegative.");
+        if (options.RetryBackoffSeconds < 0 || !double.IsFinite(options.RetryBackoffSeconds))
+            failures.Add("GitHub:RetryBackoffSeconds must be a finite nonnegative number.");
+        if (options.MaxRateLimitWaitSeconds < 0)
+            failures.Add("GitHub:MaxRateLimitWaitSeconds must be nonnegative.");
+
+        if (!Uri.TryCreate(options.ApiBaseUrl, UriKind.Absolute, out var apiBaseUrl) ||
+            (apiBaseUrl.Scheme != Uri.UriSchemeHttp && apiBaseUrl.Scheme != Uri.UriSchemeHttps))
+        {
+            failures.Add("GitHub:ApiBaseUrl must be an absolute HTTP or HTTPS URL.");
+        }
+
+        foreach (var (repository, index) in (options.Repositories ?? []).Select((repository, index) => (repository, index)))
+        {
+            if (repository is null)
+            {
+                failures.Add($"GitHub:Repositories:{index} must not be null.");
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(repository.Owner))
+                failures.Add($"GitHub:Repositories:{index}:Owner must not be blank.");
+            if (string.IsNullOrWhiteSpace(repository.Name))
+                failures.Add($"GitHub:Repositories:{index}:Name must not be blank.");
+            if (repository.InitialLookbackDays < 0)
+                failures.Add($"GitHub:Repositories:{index}:InitialLookbackDays must be nonnegative.");
+        }
+
+        return failures.Count == 0
+            ? ValidateOptionsResult.Success
+            : ValidateOptionsResult.Fail(failures);
+    }
 }

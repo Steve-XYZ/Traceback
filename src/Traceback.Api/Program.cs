@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Traceback.Api;
 using Traceback.Application.Ingestion;
 using Traceback.Application.Queries;
@@ -15,9 +17,19 @@ builder.ConfigureObservability();
 builder.Services.AddOpenApi();
 builder.Services.AddProblemDetails();
 
-builder.Services.AddInfrastructure(
-    builder.Configuration.GetConnectionString("Default")
-    ?? DesignTimeDbContextFactory.ResolveConnectionString());
+var connectionString = builder.Configuration.GetConnectionString("Default");
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    if (!builder.Environment.IsDevelopment())
+        throw new InvalidOperationException("ConnectionStrings:Default must be configured outside Development.");
+
+    connectionString = DesignTimeDbContextFactory.ResolveConnectionString();
+}
+
+builder.Services.AddInfrastructure(connectionString);
+builder.Services.AddHealthChecks()
+    .AddCheck("self", () => HealthCheckResult.Healthy(), tags: ["live", "ready"])
+    .AddCheck<PostgresHealthCheck>("postgres", tags: ["ready"]);
 
 // The fixture connector is a real connector: it enters through the same
 // IConnector → IIngestionService boundary a live GitHub/Linear connector will use.
@@ -35,7 +47,9 @@ if (app.Environment.IsDevelopment())
 
 app.UseExceptionHandler();
 
-app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+app.MapHealthChecks("/healthz/live", HealthCheckEndpoints.ForTag("live"));
+app.MapHealthChecks("/healthz/ready", HealthCheckEndpoints.ForTag("ready"));
+app.MapHealthChecks("/healthz", HealthCheckEndpoints.ForTag("ready"));
 
 app.MapPost("/api/admin/ingest/fixtures", async (IConnector connector, IIngestionService ingestion, CancellationToken ct) =>
 {
@@ -142,8 +156,9 @@ app.MapPost("/api/admin/integrations/github/sync/{owner}/{repo}",
 app.MapGet("/api/admin/integrations/github/status", async (ISyncStateQueries states, CancellationToken ct) =>
     Results.Ok(await states.GetStatesAsync("github", ct)));
 
-// Apply pending EF Core migrations on startup (local/dev default; disable with MigrateOnStartup=false).
-if (app.Configuration.GetValue("MigrateOnStartup", true))
+// Apply pending EF Core migrations on startup (Development default; disable or
+// enable explicitly with MigrateOnStartup).
+if (app.Configuration.GetValue<bool?>("MigrateOnStartup") ?? app.Environment.IsDevelopment())
 {
     using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<TracebackDbContext>();

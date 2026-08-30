@@ -37,14 +37,19 @@ Settings bind from the `GitHub` configuration section
 | `GitHub:Token` | — | API token. Supply through user secrets or the environment, never a committed file. |
 | `GitHub:TokenFile` | — | Alternative: path to a file containing the token (Docker/Kubernetes secret style). Re-read at most every 30 seconds, so rotation needs no restart. |
 | `GitHub:ApiBaseUrl` | `https://api.github.com/` | Override for GitHub Enterprise Server. |
-| `GitHub:InitialLookbackDays` | `30` | History depth of a repository's first synchronization. |
-| `GitHub:IncrementalOverlapDays` | `7` | How far behind its watermark each stream re-inspects on later passes. |
-| `GitHub:PageSize` | `100` | `per_page` for every listing request (GitHub's maximum). |
-| `GitHub:MaxPagesPerFetch` | `200` | Safety cap per stream per pass. Hitting it leaves the checkpoint unadvanced. |
-| `GitHub:MaxRetries` | `3` | Bounded retries for transient failures. |
-| `GitHub:RetryBackoffSeconds` | `1.0` | Base of the exponential backoff. |
-| `GitHub:MaxRateLimitWaitSeconds` | `120` | Longest in-pipeline wait for a rate-limit reset before failing with the reset time. |
-| `GitHub:Repositories[]` | empty | `Owner`, `Name`, optional `InitialLookbackDays`. |
+| `GitHub:InitialLookbackDays` | `30` (nonnegative) | History depth of a repository's first synchronization. |
+| `GitHub:IncrementalOverlapDays` | `7` (nonnegative) | How far behind its watermark each stream re-inspects on later passes. |
+| `GitHub:PageSize` | `100` (1–100) | `per_page` for every listing request (GitHub's maximum). |
+| `GitHub:MaxPagesPerFetch` | `200` (> 0) | Safety cap per stream per pass. Hitting it leaves the checkpoint unadvanced. |
+| `GitHub:MaxRetries` | `3` (nonnegative) | Bounded retries for transient failures. |
+| `GitHub:RetryBackoffSeconds` | `1.0` (finite, nonnegative) | Base of the exponential backoff. |
+| `GitHub:MaxRateLimitWaitSeconds` | `120` (nonnegative) | Longest in-pipeline wait for a rate-limit reset before failing with the reset time. |
+| `GitHub:Repositories[]` | empty | `Owner` and `Name` must be nonblank; optional `InitialLookbackDays` must be nonnegative. |
+
+The connector validates these values when the host starts. An empty repository
+list and an unset token remain valid so local fixture-only runs do not need
+GitHub credentials. `GitHub:ApiBaseUrl` must be an absolute `http` or `https`
+URL.
 
 Only repositories listed under `GitHub:Repositories` can be synchronized; the
 admin endpoint rejects anything else with 404 rather than reaching out to an
