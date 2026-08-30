@@ -68,6 +68,40 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
     }
 
     [Fact]
+    public async Task Statusless_observation_does_not_watermark_a_later_older_terminal_update()
+    {
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+        var deployedAt = new DateTimeOffset(2026, 08, 20, 11, 00, 00, TimeSpan.Zero);
+
+        await app.IngestAsync([Deployment("docker", "checkout/deployment-statusless-first", Artifact, null,
+            deployedAt, deployedAt.AddMinutes(10), deployedAt.AddMinutes(11))]);
+        await app.IngestAsync([Deployment("docker", "checkout/deployment-statusless-first", Artifact, DeploymentOutcome.Succeeded,
+            deployedAt, deployedAt.AddMinutes(5), deployedAt.AddMinutes(12))]);
+
+        var history = await app.Client.GetJsonAsync(
+            "/api/services/checkout/environments/staging/deployments?from=2026-08-20T00:00:00Z&to=2026-08-21T00:00:00Z");
+        Assert.Equal("succeeded", history.GetProperty("deployments")[0].GetProperty("deployment").GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Statusless_observation_does_not_block_terminal_progress_after_nonterminal_state()
+    {
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+        var deployedAt = new DateTimeOffset(2026, 08, 20, 11, 00, 00, TimeSpan.Zero);
+
+        await app.IngestAsync([Deployment("docker", "checkout/deployment-statusless-middle", Artifact, DeploymentOutcome.InProgress,
+            deployedAt, deployedAt, deployedAt.AddMinutes(1))]);
+        await app.IngestAsync([Deployment("docker", "checkout/deployment-statusless-middle", Artifact, null,
+            deployedAt, deployedAt.AddMinutes(10), deployedAt.AddMinutes(11))]);
+        await app.IngestAsync([Deployment("docker", "checkout/deployment-statusless-middle", Artifact, DeploymentOutcome.Succeeded,
+            deployedAt, deployedAt.AddMinutes(5), deployedAt.AddMinutes(12))]);
+
+        var history = await app.Client.GetJsonAsync(
+            "/api/services/checkout/environments/staging/deployments?from=2026-08-20T00:00:00Z&to=2026-08-21T00:00:00Z");
+        Assert.Equal("succeeded", history.GetProperty("deployments")[0].GetProperty("deployment").GetProperty("status").GetString());
+    }
+
+    [Fact]
     public async Task A_second_provider_adds_deployment_evidence_to_the_existing_natural_deployment()
     {
         await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
@@ -85,13 +119,49 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
             "/api/services/checkout/environments/staging/current-deployment");
         var sources = current.GetProperty("current").GetProperty("deployment").GetProperty("sources")
             .EnumerateArray()
-            .Select(source => source.GetProperty("provider").GetString())
+            .Select(source => $"{source.GetProperty("provider").GetString()}/{source.GetProperty("externalKey").GetString()}")
             .ToHashSet(StringComparer.Ordinal);
 
         Assert.Equal(1, await CountAsync(app, "deployments"));
         Assert.Equal(2, await CountDeploymentIdentitiesAsync(app));
-        Assert.Contains("docker", sources);
-        Assert.Contains("argocd", sources);
+        Assert.Contains("docker/checkout/docker-rollout-1", sources);
+        Assert.Contains("argocd/checkout/argocd-rollout-7", sources);
+    }
+
+    [Fact]
+    public async Task A_second_provider_cannot_overwrite_the_canonical_provider_status_clock()
+    {
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+        var deployedAt = new DateTimeOffset(2026, 08, 20, 12, 00, 00, TimeSpan.Zero);
+
+        await app.IngestAsync([Deployment("docker", "checkout/provider-status", Artifact, DeploymentOutcome.InProgress,
+            deployedAt, deployedAt, deployedAt.AddMinutes(1))]);
+        await app.IngestAsync([Deployment("argocd", "checkout/provider-status", Artifact, DeploymentOutcome.Failed,
+            deployedAt, deployedAt.AddHours(1), deployedAt.AddHours(1).AddMinutes(1))]);
+        await app.IngestAsync([Deployment("docker", "checkout/provider-status", Artifact, DeploymentOutcome.Succeeded,
+            deployedAt, deployedAt.AddMinutes(30), deployedAt.AddHours(1).AddMinutes(2))]);
+
+        var history = await app.Client.GetJsonAsync(
+            "/api/services/checkout/environments/staging/deployments?from=2026-08-20T00:00:00Z&to=2026-08-21T00:00:00Z");
+        Assert.Equal("succeeded", history.GetProperty("deployments")[0].GetProperty("deployment").GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task Legacy_terminal_deployment_without_watermark_cannot_be_regressed()
+    {
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+        var deployedAt = new DateTimeOffset(2026, 08, 20, 15, 00, 00, TimeSpan.Zero);
+
+        await app.IngestAsync([Deployment("docker", "checkout/legacy-terminal", Artifact, DeploymentOutcome.Succeeded,
+            deployedAt, deployedAt, deployedAt.AddMinutes(1))]);
+        await ExecuteAsync(app, "UPDATE deployments SET provider_state_at = NULL");
+
+        await app.IngestAsync([Deployment("docker", "checkout/legacy-terminal", Artifact, DeploymentOutcome.Failed,
+            deployedAt, deployedAt.AddMinutes(-10), deployedAt.AddMinutes(2))]);
+
+        var history = await app.Client.GetJsonAsync(
+            "/api/services/checkout/environments/staging/deployments?from=2026-08-20T00:00:00Z&to=2026-08-21T00:00:00Z");
+        Assert.Equal("succeeded", history.GetProperty("deployments")[0].GetProperty("deployment").GetProperty("status").GetString());
     }
 
     [Fact]
@@ -147,11 +217,72 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         Assert.Equal(newCommitSha, current.GetProperty("current").GetProperty("revision").GetProperty("sha").GetString());
     }
 
+    [Fact]
+    public async Task Work_item_chain_includes_explicit_deployment_when_run_has_no_artifact_edge()
+    {
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+        var deployedAt = new DateTimeOffset(2026, 08, 20, 16, 00, 00, TimeSpan.Zero);
+        var commitSha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        var pullRequestKey = "checkout/pr-42";
+        var runKey = "checkout/run-explicit-no-artifact";
+        var workItemKey = "BOS-0042";
+
+        await app.IngestAsync(
+        [
+            new WorkItemObserved(
+                new EventProvenance("linear", "work_item", workItemKey, null, deployedAt, deployedAt),
+                workItemKey,
+                "Deploy checkout",
+                null,
+                "open",
+                "task",
+                null,
+                null,
+                [new ExternalRef("github", "pull_request", pullRequestKey)]),
+            new PullRequestObserved(
+                new EventProvenance("github", "pull_request", pullRequestKey, null, deployedAt, deployedAt),
+                pullRequestKey,
+                "checkout",
+                42,
+                "Deploy checkout",
+                "open",
+                null,
+                null,
+                null,
+                [commitSha],
+                UpdatedAt: deployedAt),
+            new CommitObserved(
+                new EventProvenance("github", "commit", $"checkout@{commitSha}", null, deployedAt, deployedAt),
+                commitSha,
+                "checkout",
+                "Deploy checkout",
+                deployedAt,
+                null,
+                deployedAt,
+                null),
+            Deployment("docker", "checkout/deployment-no-artifact-edge", Artifact, DeploymentOutcome.Succeeded,
+                deployedAt, deployedAt, deployedAt.AddMinutes(1),
+                new ExternalRef("github", "workflow_run", runKey)),
+            WorkflowRun(runKey, commitSha, Artifact, deployedAt.AddMinutes(-2), deployedAt, 42, []),
+        ]);
+
+        Assert.Equal(0, await CountAsync(app, "workflow_run_artifacts"));
+        var chain = await app.Client.GetJsonAsync($"/api/work-items/{workItemKey}/deployment");
+        var deployments = chain.GetProperty("chains")[0]
+            .GetProperty("commits")[0]
+            .GetProperty("workflowRuns")[0]
+            .GetProperty("artifacts")[0]
+            .GetProperty("deployments");
+
+        Assert.Contains(deployments.EnumerateArray(), deployment =>
+            deployment.GetProperty("status").GetString() == "succeeded");
+    }
+
     private static DeploymentObserved Deployment(
         string provider,
         string externalKey,
         ArtifactDescriptor artifact,
-        DeploymentOutcome outcome,
+        DeploymentOutcome? outcome,
         DateTimeOffset deployedAt,
         DateTimeOffset occurredAt,
         DateTimeOffset observedAt,
@@ -171,7 +302,8 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         ArtifactDescriptor artifact,
         DateTimeOffset startedAt,
         DateTimeOffset completedAt,
-        long runNumber) =>
+        long runNumber,
+        IReadOnlyList<ArtifactDescriptor>? producedArtifacts = null) =>
         new(
             new EventProvenance("github", "workflow_run", externalName, null, completedAt, completedAt.AddMinutes(2)),
             externalName,
@@ -182,7 +314,7 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
             startedAt,
             completedAt,
             commitSha,
-            [artifact],
+            producedArtifacts ?? [artifact],
             UpdatedAt: completedAt);
 
     private static async Task<int> CountAsync(TracebackApp app, string table)
@@ -201,5 +333,13 @@ public sealed class DeploymentCorrectnessTests(PostgresContainerFixture postgres
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT count(*) FROM external_identities WHERE entity_type_name = 'deployment'";
         return Convert.ToInt32(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static async Task ExecuteAsync(TracebackApp app, string sql)
+    {
+        await using var connection = new NpgsqlConnection(app.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync();
     }
 }
