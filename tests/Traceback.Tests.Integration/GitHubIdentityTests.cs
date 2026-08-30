@@ -231,13 +231,153 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
         Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
         Assert.Equal(
             [
-                $"provider-a|provider-a|{externalKey}",
-                $"provider-b|provider-b|{externalKey}",
+                $"artifact:10:provider-a:{externalKey}",
+                $"artifact:10:provider-b:{externalKey}",
             ],
-            await GitHubSyncHarness.QueryAsync(
-                app,
-                "SELECT created_by_provider || '|' || canonical_key FROM build_artifacts " +
-                "ORDER BY created_by_provider"));
+            await GitHubSyncHarness.QueryAsync(app, "SELECT canonical_key FROM build_artifacts ORDER BY created_by_provider"));
+    }
+
+    [Fact]
+    public async Task Provider_scoped_fallback_keys_are_unambiguous_when_inputs_contain_delimiters()
+    {
+        var observedAt = new DateTimeOffset(2026, 8, 25, 10, 0, 0, TimeSpan.Zero);
+        static BuildArtifactObserved Artifact(string provider, string key, DateTimeOffset observedAt) =>
+            new(
+                new EventProvenance(provider, "build_artifact", key, null, observedAt, observedAt),
+                new ArtifactDescriptor("build-output", null, null, null, key));
+
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+
+        var result = await app.IngestAsync([
+            Artifact("a|b", "c", observedAt),
+            Artifact("a", "b|c", observedAt),
+        ]);
+
+        Assert.Equal(2, result.Applied);
+        Assert.Equal(
+            ["artifact:1:a:b|c", "artifact:3:a|b:c"],
+            await GitHubSyncHarness.QueryAsync(app, "SELECT canonical_key FROM build_artifacts ORDER BY canonical_key"));
+    }
+
+    [Fact]
+    public async Task Provider_scoped_fallback_key_is_bounded_for_maximum_external_key()
+    {
+        var observedAt = new DateTimeOffset(2026, 8, 25, 10, 0, 0, TimeSpan.Zero);
+        var firstKey = new string('x', 768);
+        var secondKey = new string('x', 767) + "y";
+
+        static BuildArtifactObserved Artifact(string key, DateTimeOffset observedAt) =>
+            new(
+                new EventProvenance("provider", "build_artifact", key, null, observedAt, observedAt),
+                new ArtifactDescriptor("build-output", null, null, null, key));
+
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+
+        var result = await app.IngestAsync([
+            Artifact(firstKey, observedAt),
+            Artifact(secondKey, observedAt),
+        ]);
+
+        Assert.Equal(2, result.Applied);
+        var canonicalKeys = await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT canonical_key FROM build_artifacts ORDER BY canonical_key");
+        Assert.Equal(2, canonicalKeys.Count);
+        Assert.All(canonicalKeys, key =>
+        {
+            Assert.True(key.Length <= 768);
+            Assert.Contains(":sha256:", key, StringComparison.Ordinal);
+        });
+        Assert.Equal(2, canonicalKeys.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public async Task Cross_batch_provider_key_hit_reconciles_digest_owner_and_all_references()
+    {
+        const string externalKey = "provider-a/build-output";
+        const string digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        var firstObservedAt = new DateTimeOffset(2026, 8, 24, 10, 0, 0, TimeSpan.Zero);
+        var secondObservedAt = firstObservedAt.AddHours(1);
+        var thirdObservedAt = firstObservedAt.AddHours(2);
+        var deploymentAt = firstObservedAt.AddHours(3);
+        var nonDuplicateDeploymentAt = deploymentAt.AddHours(1);
+
+        var firstRun = new WorkflowRunObserved(
+            new EventProvenance("provider-a", "workflow_run", "provider-a/run-1", null, firstObservedAt, firstObservedAt),
+            "provider-a/run-1", null, null, null, null, null, null, null,
+            [new ArtifactDescriptor("build-output", null, null, null, externalKey)]);
+        var secondRun = new WorkflowRunObserved(
+            new EventProvenance("provider-a", "workflow_run", "provider-a/run-2", null, firstObservedAt, firstObservedAt),
+            "provider-a/run-2", null, null, null, null, null, null, null,
+            [new ArtifactDescriptor("build-output", null, null, null, externalKey)]);
+        var firstDeployment = new DeploymentObserved(
+            new EventProvenance("provider-a", "deployment", "provider-a/deployment-1", null, firstObservedAt, firstObservedAt),
+            "service", "production",
+            new ArtifactDescriptor("build-output", null, null, null, externalKey),
+            DeploymentOutcome.Succeeded, deploymentAt, null);
+        var nonDuplicateDeployment = new DeploymentObserved(
+            new EventProvenance("provider-a", "deployment", "provider-a/deployment-2", null, firstObservedAt, firstObservedAt),
+            "other-service", "production",
+            new ArtifactDescriptor("build-output", null, null, null, externalKey),
+            DeploymentOutcome.Succeeded, nonDuplicateDeploymentAt, null);
+
+        var digestArtifact = new BuildArtifactObserved(
+            new EventProvenance("provider-b", "build_artifact", "provider-b/build-output", null, secondObservedAt, secondObservedAt),
+            new ArtifactDescriptor("build-output", null, digest, null));
+        var digestRun = new WorkflowRunObserved(
+            new EventProvenance("provider-a", "workflow_run", "provider-a/run-1", null, secondObservedAt, secondObservedAt),
+            "provider-a/run-1", null, null, null, null, null, null, null,
+            [new ArtifactDescriptor("build-output", null, digest, null)]);
+        var digestDeployment = new DeploymentObserved(
+            new EventProvenance("provider-a", "deployment", "provider-a/deployment-1-digest", null, secondObservedAt, secondObservedAt),
+            "service", "production",
+            new ArtifactDescriptor("build-output", null, digest, null),
+            DeploymentOutcome.Succeeded, deploymentAt, null);
+        var reconciledArtifact = new BuildArtifactObserved(
+            new EventProvenance("provider-a", "build_artifact", externalKey, null, thirdObservedAt, thirdObservedAt),
+            new ArtifactDescriptor("build-output", null, digest, null, externalKey));
+
+        await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
+
+        Assert.Equal(3, (await app.IngestAsync([firstRun, secondRun, firstDeployment])).Applied);
+        Assert.Equal(1, (await app.IngestAsync([digestArtifact])).Applied);
+        Assert.Equal(1, (await app.IngestAsync([digestRun])).Applied);
+        Assert.Equal(1, (await app.IngestAsync([digestDeployment])).Applied);
+        Assert.Equal(1, (await app.IngestAsync([nonDuplicateDeployment])).Applied);
+
+        var result = await app.IngestAsync([reconciledArtifact]);
+
+        Assert.Equal(1, result.Applied);
+        Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
+        Assert.Equal([digest], await GitHubSyncHarness.QueryAsync(app, "SELECT digest FROM build_artifacts"));
+        Assert.Equal([digest], await GitHubSyncHarness.QueryAsync(app, "SELECT canonical_key FROM build_artifacts"));
+
+        // R1 was linked to both rows before reconciliation; R2 only to the
+        // provider-key row. Both references survive, with the duplicate edge
+        // collapsed at the composite-key boundary.
+        Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "workflow_run_artifacts"));
+        Assert.Equal(["1"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(DISTINCT build_artifact_id) FROM workflow_run_artifacts"));
+
+        // The deployment at deploymentAt existed on both rows and collapses to
+        // one natural-key row; the later deployment migrates without collision.
+        Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "deployments"));
+        Assert.Equal(["1"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(DISTINCT artifact_id) FROM deployments"));
+        Assert.Equal(3, (await ArtifactIdentityKeysAsync(app)).Count);
+        Assert.Equal(["3"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(*) FROM external_identities WHERE entity_type_name = 'deployment'"));
+        Assert.Equal(8, await GitHubSyncHarness.CountRowsAsync(app, "observations"));
+
+        var repeat = await app.IngestAsync([reconciledArtifact]);
+        Assert.Equal(0, repeat.Applied);
+        Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
+        Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "workflow_run_artifacts"));
+        Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "deployments"));
+        Assert.Equal(8, await GitHubSyncHarness.CountRowsAsync(app, "observations"));
     }
 
     [Fact]

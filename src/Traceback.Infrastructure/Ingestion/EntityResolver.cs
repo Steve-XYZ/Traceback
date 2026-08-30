@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography;
+using System.Text;
 using Traceback.Connectors.Abstractions;
 using Traceback.Domain.Entities;
 using Traceback.Infrastructure.Persistence;
@@ -30,6 +32,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
     // Digest aliases are global content identities; provider-stable artifact
     // keys stay in their provider namespace.
     private readonly Dictionary<(string? Provider, string Key), BuildArtifact> _artifactCache = [];
+    private readonly Dictionary<Guid, Guid> _artifactMerges = [];
     private readonly Dictionary<(string Provider, string Name), Service> _serviceCache = [];
     private readonly Dictionary<(string Provider, string Name), DeploymentEnvironment> _environmentCache = [];
 
@@ -285,34 +288,81 @@ internal sealed class EntityResolver(TracebackDbContext db)
             }
         }
 
+        BuildArtifact? digestOwner = null;
         if (digestKey is not null)
         {
             var identity = await FindAnyProviderIdentityAsync(ExternalEntityTypes.BuildArtifact, digestKey, ct);
-            artifact ??= await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
-                ?? await db.BuildArtifacts.FirstOrDefaultAsync(a => a.Digest == digestKey, ct);
+            var identityArtifact = await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct);
+            digestOwner = identityArtifact is not null &&
+                          string.Equals(NormalizeSha(identityArtifact.Digest ?? string.Empty), digestKey, StringComparison.Ordinal)
+                ? identityArtifact
+                : await db.BuildArtifacts.FirstOrDefaultAsync(a => a.Digest == digestKey, ct);
         }
-        if (artifact is null && externalKey is not null)
+
+        // Resolve provider aliases even when a digest owner was found. A
+        // provider key can have been persisted on a different row in an earlier
+        // batch; in that case the two rows must be reconciled before the caller
+        // creates any new edge or deployment for this observation.
+        var providerCandidates = new List<BuildArtifact>();
+        foreach (var key in new[] { externalKey, versionKey }.Where(k => k is not null).Distinct(StringComparer.Ordinal))
         {
-            var identity = await FindIdentityAsync(provider, ExternalEntityTypes.BuildArtifact, externalKey, ct);
-            artifact ??= await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
-                ?? await FindProviderCanonicalArtifactAsync(provider, externalKey, ct);
+            var cacheKey = (Provider: (string?)provider, Key: key!);
+            if (_artifactCache.TryGetValue(cacheKey, out var cachedArtifact))
+            {
+                providerCandidates.Add(cachedArtifact);
+                continue;
+            }
+
+            var identity = await FindIdentityAsync(provider, ExternalEntityTypes.BuildArtifact, key!, ct);
+            var candidate = await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
+                ?? await FindProviderCanonicalArtifactAsync(provider, key!, ct);
+            if (candidate is not null)
+                providerCandidates.Add(candidate);
         }
-        if (artifact is null && versionKey is not null)
+
+        // The same alias can arrive through both the per-batch cache and the
+        // database. Preserve the first candidate's order while avoiding a
+        // repeated merge of the same row.
+        providerCandidates = providerCandidates
+            .GroupBy(candidate => candidate.Id)
+            .Select(group => group.First())
+            .ToList();
+
+        if (digestOwner is not null)
         {
-            var identity = await FindIdentityAsync(provider, ExternalEntityTypes.BuildArtifact, versionKey, ct);
-            artifact ??= await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
-                ?? await FindProviderCanonicalArtifactAsync(provider, versionKey, ct);
+            foreach (var candidate in providerCandidates)
+            {
+                if (candidate.Id == digestOwner.Id)
+                    continue;
+                ValidateArtifactDigest(candidate, digestKey!);
+                digestOwner = await MergeArtifactAsync(candidate, digestOwner, ct);
+            }
+
+            if (artifact is not null && artifact.Id != digestOwner.Id)
+            {
+                ValidateArtifactDigest(artifact, digestKey!);
+                artifact = await MergeArtifactAsync(artifact, digestOwner, ct);
+            }
+            else
+            {
+                artifact = digestOwner;
+            }
         }
+        else if (artifact is null)
+        {
+            artifact = providerCandidates.FirstOrDefault();
+        }
+
         if (artifact is not null)
         {
             // Register any newly-learned aliases against the same artifact.
             foreach (var cacheKey in ArtifactCacheKeys(provider, digestKey, externalKey, versionKey))
             {
                 await EnsureAliasAsync(artifact, cacheKey.Key, provider, observedAt, ct);
-                _artifactCache.TryAdd(cacheKey, artifact);
+                _artifactCache[cacheKey] = artifact;
             }
-            if (artifact.Digest is null && descriptor.Digest is not null)
-                artifact.Digest = descriptor.Digest;
+            if (artifact.Digest is null && digestKey is not null)
+                artifact.Digest = digestKey;
             if (artifact.Uri is null && descriptor.Uri is not null)
                 artifact.Uri = descriptor.Uri;
             Touch(artifact, observedAt);
@@ -329,7 +379,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
         {
             Name = descriptor.Name.Trim(),
             Version = descriptor.Version,
-            Digest = descriptor.Digest,
+            Digest = digestKey,
             Uri = descriptor.Uri,
             CanonicalKey = canonical,
             CreatedByProvider = provider,
@@ -462,6 +512,396 @@ internal sealed class EntityResolver(TracebackDbContext db)
                  (a.CanonicalKey == key || a.CanonicalKey == scopedKey), ct);
     }
 
+    private static void ValidateArtifactDigest(BuildArtifact artifact, string digestKey)
+    {
+        if (artifact.Digest is not null &&
+            !string.Equals(NormalizeSha(artifact.Digest), digestKey, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Artifact provider key resolves to digest '{artifact.Digest}', but the observation reports '{digestKey}'.");
+        }
+    }
+
+    /// <summary>
+    /// Reconciles a provider-key artifact into an already persisted digest
+    /// owner. Artifact references are foreign keys, so the loser cannot simply
+    /// be deleted: all join rows, deployments, and aliases must be moved first.
+    /// Duplicate join/deployment natural keys are collapsed before the foreign
+    /// key is changed, which keeps the unique indexes valid throughout the
+    /// enclosing ingestion transaction.
+    /// </summary>
+    private async Task<BuildArtifact> MergeArtifactAsync(
+        BuildArtifact source,
+        BuildArtifact target,
+        CancellationToken ct)
+    {
+        if (source.Id == target.Id)
+            return target;
+
+        if (_artifactMerges.TryGetValue(source.Id, out var mergedId) && mergedId == target.Id)
+            return target;
+
+        ValidateArtifactDigest(source, NormalizeSha(target.Digest ?? string.Empty));
+        if (target.Digest is null && source.Digest is not null)
+            target.Digest = NormalizeSha(source.Digest);
+
+        if (target.Version is null && source.Version is not null)
+            target.Version = source.Version;
+        if (target.Uri is null && source.Uri is not null)
+            target.Uri = source.Uri;
+        if (target.Name.Length == 0 && source.Name.Length > 0)
+            target.Name = source.Name;
+        target.IsPlaceholder &= source.IsPlaceholder;
+        Touch(target, source.FirstObservedAt);
+        Touch(target, source.LastObservedAt);
+
+        await MergeWorkflowRunArtifactReferencesAsync(source.Id, target.Id, ct);
+        await MergeDeploymentReferencesAsync(source.Id, target.Id, ct);
+        await MergeArtifactIdentitiesAsync(source.Id, target.Id, ct);
+
+        // A source row created earlier in this batch may still be Added. Its
+        // identities and references were handled in-memory by the helpers;
+        // removing it now prevents the pending insert from resurrecting it.
+        db.BuildArtifacts.Remove(source);
+        _artifactMerges[source.Id] = target.Id;
+        foreach (var key in _artifactCache
+                     .Where(pair => pair.Value.Id == source.Id)
+                     .Select(pair => pair.Key)
+                     .ToList())
+        {
+            _artifactCache[key] = target;
+        }
+
+        return target;
+    }
+
+    private async Task MergeWorkflowRunArtifactReferencesAsync(Guid sourceId, Guid targetId, CancellationToken ct)
+    {
+        var trackedSource = db.ChangeTracker.Entries<WorkflowRunArtifact>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.BuildArtifactId == sourceId)
+            .ToList();
+        var trackedTargetRunIds = db.ChangeTracker.Entries<WorkflowRunArtifact>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.BuildArtifactId == targetId)
+            .Select(entry => entry.Entity.WorkflowRunId)
+            .ToHashSet();
+
+        var persistedSource = await db.WorkflowRunArtifacts
+            .AsNoTracking()
+            .Where(edge => edge.BuildArtifactId == sourceId)
+            .ToListAsync(ct);
+        var persistedTargetRunIds = await db.WorkflowRunArtifacts
+            .AsNoTracking()
+            .Where(edge => edge.BuildArtifactId == targetId)
+            .Select(edge => edge.WorkflowRunId)
+            .ToListAsync(ct);
+        var targetRunIds = persistedTargetRunIds.ToHashSet();
+        targetRunIds.UnionWith(trackedTargetRunIds);
+
+        foreach (var entry in trackedSource)
+        {
+            if (targetRunIds.Contains(entry.Entity.WorkflowRunId))
+            {
+                var trackedTarget = db.ChangeTracker.Entries<WorkflowRunArtifact>()
+                    .FirstOrDefault(candidate => candidate.State != EntityState.Deleted &&
+                        candidate.Entity.WorkflowRunId == entry.Entity.WorkflowRunId &&
+                        candidate.Entity.BuildArtifactId == targetId);
+                if (trackedTarget is not null &&
+                    entry.Entity.EstablishedSequence < trackedTarget.Entity.EstablishedSequence)
+                {
+                    trackedTarget.Entity.EstablishedSequence = entry.Entity.EstablishedSequence;
+                }
+
+                if (entry.State == EntityState.Added)
+                    db.WorkflowRunArtifacts.Remove(entry.Entity);
+                else
+                    entry.State = EntityState.Detached;
+            }
+            else if (entry.State == EntityState.Added)
+            {
+                // Added keys are not database keys yet, so changing this value
+                // retains the pending edge and its observation sequence.
+                entry.Entity.BuildArtifactId = targetId;
+            }
+            else
+            {
+                // Existing key values are immutable in EF's change tracker. The
+                // database update below handles this row after detaching it.
+                entry.State = EntityState.Detached;
+            }
+        }
+
+        foreach (var edge in persistedSource.Where(edge => targetRunIds.Contains(edge.WorkflowRunId)))
+        {
+            var targetEdge = await db.WorkflowRunArtifacts.FirstAsync(
+                candidate => candidate.WorkflowRunId == edge.WorkflowRunId && candidate.BuildArtifactId == targetId,
+                ct);
+            if (edge.EstablishedSequence < targetEdge.EstablishedSequence)
+                targetEdge.EstablishedSequence = edge.EstablishedSequence;
+        }
+
+        if (targetRunIds.Count > 0)
+        {
+            await db.WorkflowRunArtifacts
+                .Where(edge => edge.BuildArtifactId == sourceId && targetRunIds.Contains(edge.WorkflowRunId))
+                .ExecuteDeleteAsync(ct);
+        }
+
+        await db.WorkflowRunArtifacts
+            .Where(edge => edge.BuildArtifactId == sourceId)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(edge => edge.BuildArtifactId, targetId), ct);
+    }
+
+    private async Task MergeDeploymentReferencesAsync(Guid sourceId, Guid targetId, CancellationToken ct)
+    {
+        var trackedSource = db.ChangeTracker.Entries<Deployment>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.ArtifactId == sourceId)
+            .ToList();
+        var trackedTargetKeys = db.ChangeTracker.Entries<Deployment>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.ArtifactId == targetId)
+            .Select(entry => DeploymentNaturalKey(entry.Entity))
+            .ToHashSet();
+
+        var persistedSource = await db.Deployments
+            .AsNoTracking()
+            .Where(deployment => deployment.ArtifactId == sourceId)
+            .ToListAsync(ct);
+        var persistedTarget = await db.Deployments
+            .AsNoTracking()
+            .Where(deployment => deployment.ArtifactId == targetId)
+            .ToListAsync(ct);
+        var targetKeys = persistedTarget.Select(DeploymentNaturalKey).ToHashSet();
+        targetKeys.UnionWith(trackedTargetKeys);
+
+        foreach (var entry in trackedSource)
+        {
+            var sourceDeployment = entry.Entity;
+            if (targetKeys.Contains(DeploymentNaturalKey(sourceDeployment)))
+            {
+                var targetDeployment = db.ChangeTracker.Entries<Deployment>()
+                    .Where(candidate => candidate.State != EntityState.Deleted && candidate.Entity.ArtifactId == targetId)
+                    .Select(candidate => candidate.Entity)
+                    .FirstOrDefault(candidate => DeploymentNaturalKey(candidate) == DeploymentNaturalKey(sourceDeployment));
+                targetDeployment ??= await db.Deployments.FirstOrDefaultAsync(
+                    candidate => candidate.ArtifactId == targetId &&
+                        candidate.ServiceId == sourceDeployment.ServiceId &&
+                        candidate.EnvironmentId == sourceDeployment.EnvironmentId &&
+                        candidate.DeployedAt == sourceDeployment.DeployedAt, ct);
+                if (targetDeployment is null)
+                    throw new InvalidOperationException("Artifact deployment reconciliation lost its target row.");
+
+                MergeDeploymentMetadata(targetDeployment, sourceDeployment);
+                await MergeDeploymentIdentitiesAsync(sourceDeployment.Id, targetDeployment.Id, ct);
+                if (entry.State == EntityState.Added)
+                    db.Deployments.Remove(sourceDeployment);
+                else
+                    entry.State = EntityState.Detached;
+            }
+            else if (entry.State == EntityState.Added)
+            {
+                sourceDeployment.ArtifactId = targetId;
+            }
+            else
+            {
+                entry.State = EntityState.Detached;
+            }
+        }
+
+        foreach (var sourceDeployment in persistedSource)
+        {
+            var naturalKey = DeploymentNaturalKey(sourceDeployment);
+            var targetDeployment = persistedTarget.FirstOrDefault(
+                candidate => DeploymentNaturalKey(candidate) == naturalKey);
+            if (targetDeployment is null)
+            {
+                await db.Deployments
+                    .Where(deployment => deployment.Id == sourceDeployment.Id)
+                    .ExecuteUpdateAsync(setters => setters.SetProperty(deployment => deployment.ArtifactId, targetId), ct);
+                continue;
+            }
+
+            var trackedTarget = await db.Deployments.FindAsync([targetDeployment.Id], ct)
+                ?? throw new InvalidOperationException("Artifact deployment reconciliation lost its target row.");
+            MergeDeploymentMetadata(trackedTarget, sourceDeployment);
+            await MergeDeploymentIdentitiesAsync(sourceDeployment.Id, trackedTarget.Id, ct);
+            await db.Deployments
+                .Where(deployment => deployment.Id == sourceDeployment.Id)
+                .ExecuteDeleteAsync(ct);
+        }
+    }
+
+    private async Task MergeArtifactIdentitiesAsync(Guid sourceId, Guid targetId, CancellationToken ct)
+    {
+        var trackedSource = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.BuildArtifactId == sourceId)
+            .ToList();
+        var trackedTargetKeys = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.BuildArtifactId == targetId)
+            .Select(entry => IdentityKey(entry.Entity))
+            .ToHashSet();
+
+        var persistedSource = await db.ExternalIdentities
+            .AsNoTracking()
+            .Where(identity => identity.BuildArtifactId == sourceId)
+            .ToListAsync(ct);
+        var persistedTarget = await db.ExternalIdentities
+            .AsNoTracking()
+            .Where(identity => identity.BuildArtifactId == targetId)
+            .ToListAsync(ct);
+        var targetKeys = persistedTarget.Select(IdentityKey).ToHashSet();
+        targetKeys.UnionWith(trackedTargetKeys);
+
+        foreach (var entry in trackedSource)
+        {
+            var identity = entry.Entity;
+            if (targetKeys.Contains(IdentityKey(identity)))
+            {
+                var targetIdentity = db.ChangeTracker.Entries<ExternalIdentity>()
+                    .Where(candidate => candidate.State != EntityState.Deleted && candidate.Entity.BuildArtifactId == targetId)
+                    .Select(candidate => candidate.Entity)
+                    .FirstOrDefault(candidate => IdentityKey(candidate) == IdentityKey(identity));
+                targetIdentity ??= await db.ExternalIdentities.FirstOrDefaultAsync(
+                    candidate => candidate.Provider == identity.Provider &&
+                        candidate.EntityTypeName == identity.EntityTypeName &&
+                        candidate.ExternalKey == identity.ExternalKey &&
+                        candidate.BuildArtifactId == targetId, ct);
+                if (targetIdentity is null)
+                    throw new InvalidOperationException("Artifact identity reconciliation lost its target row.");
+
+                MergeIdentityMetadata(targetIdentity, identity);
+                if (entry.State == EntityState.Added)
+                    db.ExternalIdentities.Remove(identity);
+                else
+                    entry.State = EntityState.Detached;
+            }
+            else if (entry.State == EntityState.Added)
+            {
+                identity.BuildArtifactId = targetId;
+            }
+            else
+            {
+                entry.State = EntityState.Detached;
+            }
+        }
+
+        foreach (var sourceIdentity in persistedSource)
+        {
+            var targetIdentity = persistedTarget.FirstOrDefault(
+                candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity));
+            if (targetIdentity is null)
+                continue;
+
+            var trackedTarget = await db.ExternalIdentities.FindAsync([targetIdentity.Id], ct)
+                ?? throw new InvalidOperationException("Artifact identity reconciliation lost its target row.");
+            MergeIdentityMetadata(trackedTarget, sourceIdentity);
+            await db.ExternalIdentities
+                .Where(identity => identity.Id == sourceIdentity.Id)
+                .ExecuteDeleteAsync(ct);
+        }
+
+        await db.ExternalIdentities
+            .Where(identity => identity.BuildArtifactId == sourceId)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(identity => identity.BuildArtifactId, targetId), ct);
+    }
+
+    private async Task MergeDeploymentIdentitiesAsync(Guid sourceId, Guid targetId, CancellationToken ct)
+    {
+        var trackedSource = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.DeploymentId == sourceId)
+            .ToList();
+        var trackedTargetKeys = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Where(entry => entry.State != EntityState.Deleted && entry.Entity.DeploymentId == targetId)
+            .Select(entry => IdentityKey(entry.Entity))
+            .ToHashSet();
+
+        var persistedSource = await db.ExternalIdentities
+            .AsNoTracking()
+            .Where(identity => identity.DeploymentId == sourceId)
+            .ToListAsync(ct);
+        var persistedTarget = await db.ExternalIdentities
+            .AsNoTracking()
+            .Where(identity => identity.DeploymentId == targetId)
+            .ToListAsync(ct);
+        var targetKeys = persistedTarget.Select(IdentityKey).ToHashSet();
+        targetKeys.UnionWith(trackedTargetKeys);
+
+        foreach (var entry in trackedSource)
+        {
+            var identity = entry.Entity;
+            if (targetKeys.Contains(IdentityKey(identity)))
+            {
+                var targetIdentity = db.ChangeTracker.Entries<ExternalIdentity>()
+                    .Where(candidate => candidate.State != EntityState.Deleted && candidate.Entity.DeploymentId == targetId)
+                    .Select(candidate => candidate.Entity)
+                    .FirstOrDefault(candidate => IdentityKey(candidate) == IdentityKey(identity));
+                targetIdentity ??= await db.ExternalIdentities.FirstOrDefaultAsync(
+                    candidate => candidate.Provider == identity.Provider &&
+                        candidate.EntityTypeName == identity.EntityTypeName &&
+                        candidate.ExternalKey == identity.ExternalKey &&
+                        candidate.DeploymentId == targetId, ct);
+                if (targetIdentity is null)
+                    throw new InvalidOperationException("Deployment identity reconciliation lost its target row.");
+
+                MergeIdentityMetadata(targetIdentity, identity);
+                if (entry.State == EntityState.Added)
+                    db.ExternalIdentities.Remove(identity);
+                else
+                    entry.State = EntityState.Detached;
+            }
+            else if (entry.State == EntityState.Added)
+            {
+                identity.DeploymentId = targetId;
+            }
+            else
+            {
+                entry.State = EntityState.Detached;
+            }
+        }
+
+        foreach (var sourceIdentity in persistedSource)
+        {
+            var targetIdentity = persistedTarget.FirstOrDefault(
+                candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity));
+            if (targetIdentity is null)
+                continue;
+
+            var trackedTarget = await db.ExternalIdentities.FindAsync([targetIdentity.Id], ct)
+                ?? throw new InvalidOperationException("Deployment identity reconciliation lost its target row.");
+            MergeIdentityMetadata(trackedTarget, sourceIdentity);
+            await db.ExternalIdentities
+                .Where(identity => identity.Id == sourceIdentity.Id)
+                .ExecuteDeleteAsync(ct);
+        }
+
+        await db.ExternalIdentities
+            .Where(identity => identity.DeploymentId == sourceId)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(identity => identity.DeploymentId, targetId), ct);
+    }
+
+    private static (Guid ServiceId, Guid EnvironmentId, DateTimeOffset DeployedAt) DeploymentNaturalKey(Deployment deployment) =>
+        (deployment.ServiceId, deployment.EnvironmentId, deployment.DeployedAt);
+
+    private static (string Provider, string EntityTypeName, string ExternalKey) IdentityKey(ExternalIdentity identity) =>
+        (identity.Provider, identity.EntityTypeName, identity.ExternalKey);
+
+    private static void MergeIdentityMetadata(ExternalIdentity target, ExternalIdentity source)
+    {
+        if (source.FirstObservedAt < target.FirstObservedAt)
+            target.FirstObservedAt = source.FirstObservedAt;
+        if (source.LastObservedAt > target.LastObservedAt)
+            target.LastObservedAt = source.LastObservedAt;
+    }
+
+    private static void MergeDeploymentMetadata(Deployment target, Deployment source)
+    {
+        if (target.WorkflowRunId is null)
+            target.WorkflowRunId = source.WorkflowRunId;
+        if (target.Status == DeploymentStatus.Unknown)
+            target.Status = source.Status;
+        target.IsPlaceholder &= source.IsPlaceholder;
+        Touch(target, source.FirstObservedAt);
+        Touch(target, source.LastObservedAt);
+    }
+
     private async Task AttachIdentityAsync(
         ExternalIdentity? existingIdentity,
         string entityType,
@@ -550,8 +990,26 @@ internal sealed class EntityResolver(TracebackDbContext db)
             yield return (provider, versionKey);
     }
 
-    private static string ProviderScopedCanonicalKey(string provider, string key) =>
-        $"{provider}|{key}";
+    private const int CanonicalKeyMaxLength = 768;
+
+    private static string ProviderScopedCanonicalKey(string provider, string key)
+    {
+        // The length prefix makes the provider/key boundary unambiguous even
+        // when either input contains delimiters. Long provider keys use a
+        // bounded pair hash so the persisted canonical key stays within the
+        // schema's 768-character limit.
+        var readable = $"artifact:{provider.Length}:{provider}:{key}";
+        if (readable.Length <= CanonicalKeyMaxLength)
+            return readable;
+
+        var input = Encoding.UTF8.GetBytes($"{provider.Length}:{provider}{key.Length}:{key}");
+        var hash = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant();
+        var hashedSuffix = $"sha256:{hash}";
+        var providerPrefix = $"artifact:{provider.Length}:{provider}:";
+        return providerPrefix.Length + hashedSuffix.Length <= CanonicalKeyMaxLength
+            ? providerPrefix + hashedSuffix
+            : $"artifact:{hashedSuffix}";
+    }
 
     internal static void Touch(IExternallySourced entity, DateTimeOffset observedAt)
     {
