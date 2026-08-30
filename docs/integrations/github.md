@@ -107,9 +107,13 @@ Field mapping worth knowing:
 - **Conclusions** are stored verbatim: `success`, `failure`, `cancelled`,
   `timed_out`, `skipped`, `neutral`, `action_required`. Nothing is collapsed
   into a coarser status.
-- **Artifacts** get the canonical key `{owner}/{repo}/actions/artifacts/{id}`.
-  GitHub's `digest` field is stored as provider-reported archive metadata. It
-  is not treated as a container-image digest or used to create an image link.
+- **Artifacts** use GitHub's `digest` as the persisted `BuildArtifact.CanonicalKey`
+  when it is present. A digestless artifact uses a provider-qualified fallback
+  key (or a bounded hash form) as its persisted canonical key. The raw GitHub
+  artifact key `{owner}/{repo}/actions/artifacts/{id}` remains an
+  `ExternalIdentity.ExternalKey` alias under provider `github`; it is not the
+  persisted canonical key. GitHub's `digest` is provider-reported archive
+  metadata, not a container-image link.
 
 Every REST request sends `X-GitHub-Api-Version: 2026-03-10`, the currently
 supported public GitHub REST contract.

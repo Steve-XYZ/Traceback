@@ -33,8 +33,8 @@ internal sealed class EntityResolver(TracebackDbContext db)
     // keys stay in their provider namespace.
     private readonly Dictionary<(string? Provider, string Key), BuildArtifact> _artifactCache = [];
     private readonly Dictionary<Guid, Guid> _artifactMerges = [];
-    private readonly Dictionary<(string Provider, string Name), Service> _serviceCache = [];
-    private readonly Dictionary<(string Provider, string Name), DeploymentEnvironment> _environmentCache = [];
+    private readonly Dictionary<string, Service> _serviceCache = [];
+    private readonly Dictionary<string, DeploymentEnvironment> _environmentCache = [];
 
     public async Task<SourceRepository> ResolveRepositoryAsync(string provider, string key, DateTimeOffset observedAt, CancellationToken ct)
     {
@@ -297,6 +297,16 @@ internal sealed class EntityResolver(TracebackDbContext db)
                           string.Equals(NormalizeSha(identityArtifact.Digest ?? string.Empty), digestKey, StringComparison.Ordinal)
                 ? identityArtifact
                 : await db.BuildArtifacts.FirstOrDefaultAsync(a => a.Digest == digestKey, ct);
+
+            // A digest artifact introduced earlier in this same batch may only
+            // exist in the change tracker. Treat that pending row as the
+            // digest owner so a later provider-key descriptor still merges the
+            // persisted provider row into it.
+            if (digestOwner is null && artifact is not null &&
+                string.Equals(NormalizeSha(artifact.Digest ?? string.Empty), digestKey, StringComparison.Ordinal))
+            {
+                digestOwner = artifact;
+            }
         }
 
         // Resolve provider aliases even when a digest owner was found. A
@@ -308,10 +318,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
         {
             var cacheKey = (Provider: (string?)provider, Key: key!);
             if (_artifactCache.TryGetValue(cacheKey, out var cachedArtifact))
-            {
                 providerCandidates.Add(cachedArtifact);
-                continue;
-            }
 
             var identity = await FindIdentityAsync(provider, ExternalEntityTypes.BuildArtifact, key!, ct);
             var candidate = await LoadAsync<BuildArtifact>(identity?.BuildArtifactId, ct)
@@ -399,9 +406,13 @@ internal sealed class EntityResolver(TracebackDbContext db)
     public async Task<Service> ResolveServiceAsync(string provider, string rawName, DateTimeOffset observedAt, CancellationToken ct)
     {
         var name = NormalizeName(rawName);
-        var cacheKey = (provider, name);
+        var cacheKey = name;
         if (_serviceCache.TryGetValue(cacheKey, out var cachedService))
+        {
+            await EnsureIdentityForNaturalKeyAsync(ExternalEntityTypes.Service, provider, name, cachedService.Id, observedAt,
+                (i, id) => i.ServiceId = id, ct);
             return cachedService;
+        }
 
         var existing = await db.Services.FirstOrDefaultAsync(s => s.Name == name, ct);
         Service service;
@@ -424,9 +435,13 @@ internal sealed class EntityResolver(TracebackDbContext db)
     public async Task<DeploymentEnvironment> ResolveEnvironmentAsync(string provider, string rawName, DateTimeOffset observedAt, CancellationToken ct)
     {
         var name = NormalizeName(rawName);
-        var cacheKey = (provider, name);
+        var cacheKey = name;
         if (_environmentCache.TryGetValue(cacheKey, out var cachedEnvironment))
+        {
+            await EnsureIdentityForNaturalKeyAsync(ExternalEntityTypes.Environment, provider, name, cachedEnvironment.Id, observedAt,
+                (i, id) => i.EnvironmentId = id, ct);
             return cachedEnvironment;
+        }
 
         var existing = await db.Environments.FirstOrDefaultAsync(e => e.Name == name, ct);
         DeploymentEnvironment env;
@@ -500,9 +515,16 @@ internal sealed class EntityResolver(TracebackDbContext db)
     private async ValueTask<TEntity?> LoadAsync<TEntity>(Guid? id, CancellationToken ct) where TEntity : class =>
         id is { } value ? await db.Set<TEntity>().FindAsync([value], ct) : null;
 
-    private Task<ExternalIdentity?> FindAnyProviderIdentityAsync(string entityType, string key, CancellationToken ct) =>
-        db.ExternalIdentities
+    private async Task<ExternalIdentity?> FindAnyProviderIdentityAsync(string entityType, string key, CancellationToken ct)
+    {
+        var tracked = db.ChangeTracker.Entries<ExternalIdentity>()
+            .FirstOrDefault(entry => entry.State != EntityState.Deleted
+                && entry.Entity.EntityTypeName == entityType
+                && entry.Entity.ExternalKey == key)
+            ?.Entity;
+        return tracked ?? await db.ExternalIdentities
             .FirstOrDefaultAsync(i => i.EntityTypeName == entityType && i.ExternalKey == key, ct);
+    }
 
     private Task<BuildArtifact?> FindProviderCanonicalArtifactAsync(string provider, string key, CancellationToken ct)
     {
@@ -632,9 +654,15 @@ internal sealed class EntityResolver(TracebackDbContext db)
 
         foreach (var edge in persistedSource.Where(edge => targetRunIds.Contains(edge.WorkflowRunId)))
         {
-            var targetEdge = await db.WorkflowRunArtifacts.FirstAsync(
-                candidate => candidate.WorkflowRunId == edge.WorkflowRunId && candidate.BuildArtifactId == targetId,
-                ct);
+            var targetEdge = db.ChangeTracker.Entries<WorkflowRunArtifact>()
+                .Where(entry => entry.State != EntityState.Deleted &&
+                    entry.Entity.WorkflowRunId == edge.WorkflowRunId &&
+                    entry.Entity.BuildArtifactId == targetId)
+                .Select(entry => entry.Entity)
+                .FirstOrDefault()
+                ?? await db.WorkflowRunArtifacts.FirstAsync(
+                    candidate => candidate.WorkflowRunId == edge.WorkflowRunId && candidate.BuildArtifactId == targetId,
+                    ct);
             if (edge.EstablishedSequence < targetEdge.EstablishedSequence)
                 targetEdge.EstablishedSequence = edge.EstablishedSequence;
         }
@@ -646,9 +674,32 @@ internal sealed class EntityResolver(TracebackDbContext db)
                 .ExecuteDeleteAsync(ct);
         }
 
-        await db.WorkflowRunArtifacts
-            .Where(edge => edge.BuildArtifactId == sourceId)
-            .ExecuteUpdateAsync(setters => setters.SetProperty(edge => edge.BuildArtifactId, targetId), ct);
+        if (IsPendingBuildArtifact(targetId))
+        {
+            // A set-based FK update cannot point at an Added artifact until EF
+            // has inserted that principal. The artifact FK is part of this
+            // join's key, so replace each persisted source edge with a pending
+            // target edge instead of mutating its identifying key in place.
+            var remainingSource = await db.WorkflowRunArtifacts
+                .Where(edge => edge.BuildArtifactId == sourceId)
+                .ToListAsync(ct);
+            foreach (var edge in remainingSource)
+            {
+                db.WorkflowRunArtifacts.Remove(edge);
+                await db.WorkflowRunArtifacts.AddAsync(new WorkflowRunArtifact
+                {
+                    WorkflowRunId = edge.WorkflowRunId,
+                    BuildArtifactId = targetId,
+                    EstablishedSequence = edge.EstablishedSequence,
+                }, ct);
+            }
+        }
+        else
+        {
+            await db.WorkflowRunArtifacts
+                .Where(edge => edge.BuildArtifactId == sourceId)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(edge => edge.BuildArtifactId, targetId), ct);
+        }
     }
 
     private async Task MergeDeploymentReferencesAsync(Guid sourceId, Guid targetId, CancellationToken ct)
@@ -690,6 +741,7 @@ internal sealed class EntityResolver(TracebackDbContext db)
                     throw new InvalidOperationException("Artifact deployment reconciliation lost its target row.");
 
                 MergeDeploymentMetadata(targetDeployment, sourceDeployment);
+                await RepointDeploymentObservationsAsync(sourceDeployment.Id, targetDeployment.Id, ct);
                 await MergeDeploymentIdentitiesAsync(sourceDeployment.Id, targetDeployment.Id, ct);
                 if (entry.State == EntityState.Added)
                     db.Deployments.Remove(sourceDeployment);
@@ -710,22 +762,84 @@ internal sealed class EntityResolver(TracebackDbContext db)
         {
             var naturalKey = DeploymentNaturalKey(sourceDeployment);
             var targetDeployment = persistedTarget.FirstOrDefault(
-                candidate => DeploymentNaturalKey(candidate) == naturalKey);
+                candidate => DeploymentNaturalKey(candidate) == naturalKey)
+                ?? db.ChangeTracker.Entries<Deployment>()
+                    .Where(entry => entry.State != EntityState.Deleted && entry.Entity.ArtifactId == targetId)
+                    .Select(entry => entry.Entity)
+                    .FirstOrDefault(candidate => DeploymentNaturalKey(candidate) == naturalKey);
             if (targetDeployment is null)
             {
-                await db.Deployments
-                    .Where(deployment => deployment.Id == sourceDeployment.Id)
-                    .ExecuteUpdateAsync(setters => setters.SetProperty(deployment => deployment.ArtifactId, targetId), ct);
+                if (IsPendingBuildArtifact(targetId))
+                {
+                    var sourceDeploymentEntry = await db.Deployments.FindAsync([sourceDeployment.Id], ct)
+                        ?? throw new InvalidOperationException("Artifact deployment reconciliation lost its source row.");
+                    sourceDeploymentEntry.ArtifactId = targetId;
+                }
+                else
+                {
+                    await db.Deployments
+                        .Where(deployment => deployment.Id == sourceDeployment.Id)
+                        .ExecuteUpdateAsync(setters => setters.SetProperty(deployment => deployment.ArtifactId, targetId), ct);
+                }
                 continue;
             }
 
-            var trackedTarget = await db.Deployments.FindAsync([targetDeployment.Id], ct)
+            var trackedTarget = db.ChangeTracker.Entries<Deployment>()
+                .Where(entry => entry.State != EntityState.Deleted && entry.Entity.Id == targetDeployment.Id)
+                .Select(entry => entry.Entity)
+                .FirstOrDefault()
+                ?? await db.Deployments.FindAsync([targetDeployment.Id], ct)
                 ?? throw new InvalidOperationException("Artifact deployment reconciliation lost its target row.");
             MergeDeploymentMetadata(trackedTarget, sourceDeployment);
+            await RepointDeploymentObservationsAsync(sourceDeployment.Id, trackedTarget.Id, ct);
             await MergeDeploymentIdentitiesAsync(sourceDeployment.Id, trackedTarget.Id, ct);
-            await db.Deployments
-                .Where(deployment => deployment.Id == sourceDeployment.Id)
-                .ExecuteDeleteAsync(ct);
+            if (IsPendingDeployment(trackedTarget.Id))
+            {
+                // The deployment identity FK is being moved through the change
+                // tracker. Mark the source for deletion so EF updates those
+                // identities before the source row's cascade can run.
+                var sourceDeploymentEntity = await db.Deployments.FindAsync([sourceDeployment.Id], ct)
+                    ?? throw new InvalidOperationException("Artifact deployment reconciliation lost its source row.");
+                db.Deployments.Remove(sourceDeploymentEntity);
+            }
+            else
+            {
+                await db.Deployments
+                    .Where(deployment => deployment.Id == sourceDeployment.Id)
+                    .ExecuteDeleteAsync(ct);
+            }
+        }
+    }
+
+    private async Task RepointDeploymentObservationsAsync(Guid sourceId, Guid targetId, CancellationToken ct)
+    {
+        // SetNull protects append-only observations if a deployment is removed,
+        // but reconciliation has a better target. Update tracked observations
+        // first so the later set-based update cannot leave stale entities in the
+        // change tracker when this batch saves.
+        foreach (var entry in db.ChangeTracker.Entries<Observation>()
+                     .Where(entry => entry.State != EntityState.Deleted && entry.Entity.DeploymentId == sourceId))
+        {
+            entry.Entity.DeploymentId = targetId;
+        }
+
+        if (IsPendingDeployment(targetId))
+        {
+            // DeploymentId is not part of the observation key, but the target
+            // deployment is still Added. Track persisted observations so EF
+            // inserts the target before updating this FK.
+            var persistedSource = await db.Observations
+                .Where(observation => observation.DeploymentId == sourceId)
+                .ToListAsync(ct);
+            foreach (var observation in persistedSource)
+                observation.DeploymentId = targetId;
+        }
+        else
+        {
+            await db.Observations
+                .Where(observation => observation.DeploymentId == sourceId)
+                .ExecuteUpdateAsync(
+                    setters => setters.SetProperty(observation => observation.DeploymentId, targetId), ct);
         }
     }
 
@@ -786,11 +900,19 @@ internal sealed class EntityResolver(TracebackDbContext db)
         foreach (var sourceIdentity in persistedSource)
         {
             var targetIdentity = persistedTarget.FirstOrDefault(
-                candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity));
+                candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity))
+                ?? db.ChangeTracker.Entries<ExternalIdentity>()
+                    .Where(entry => entry.State != EntityState.Deleted && entry.Entity.BuildArtifactId == targetId)
+                    .Select(entry => entry.Entity)
+                    .FirstOrDefault(candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity));
             if (targetIdentity is null)
                 continue;
 
-            var trackedTarget = await db.ExternalIdentities.FindAsync([targetIdentity.Id], ct)
+            var trackedTarget = db.ChangeTracker.Entries<ExternalIdentity>()
+                .Where(entry => entry.State != EntityState.Deleted && entry.Entity.Id == targetIdentity.Id)
+                .Select(entry => entry.Entity)
+                .FirstOrDefault()
+                ?? await db.ExternalIdentities.FindAsync([targetIdentity.Id], ct)
                 ?? throw new InvalidOperationException("Artifact identity reconciliation lost its target row.");
             MergeIdentityMetadata(trackedTarget, sourceIdentity);
             await db.ExternalIdentities
@@ -798,9 +920,20 @@ internal sealed class EntityResolver(TracebackDbContext db)
                 .ExecuteDeleteAsync(ct);
         }
 
-        await db.ExternalIdentities
-            .Where(identity => identity.BuildArtifactId == sourceId)
-            .ExecuteUpdateAsync(setters => setters.SetProperty(identity => identity.BuildArtifactId, targetId), ct);
+        if (IsPendingBuildArtifact(targetId))
+        {
+            var remainingSource = await db.ExternalIdentities
+                .Where(identity => identity.BuildArtifactId == sourceId)
+                .ToListAsync(ct);
+            foreach (var identity in remainingSource)
+                identity.BuildArtifactId = targetId;
+        }
+        else
+        {
+            await db.ExternalIdentities
+                .Where(identity => identity.BuildArtifactId == sourceId)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(identity => identity.BuildArtifactId, targetId), ct);
+        }
     }
 
     private async Task MergeDeploymentIdentitiesAsync(Guid sourceId, Guid targetId, CancellationToken ct)
@@ -860,11 +993,19 @@ internal sealed class EntityResolver(TracebackDbContext db)
         foreach (var sourceIdentity in persistedSource)
         {
             var targetIdentity = persistedTarget.FirstOrDefault(
-                candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity));
+                candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity))
+                ?? db.ChangeTracker.Entries<ExternalIdentity>()
+                    .Where(entry => entry.State != EntityState.Deleted && entry.Entity.DeploymentId == targetId)
+                    .Select(entry => entry.Entity)
+                    .FirstOrDefault(candidate => IdentityKey(candidate) == IdentityKey(sourceIdentity));
             if (targetIdentity is null)
                 continue;
 
-            var trackedTarget = await db.ExternalIdentities.FindAsync([targetIdentity.Id], ct)
+            var trackedTarget = db.ChangeTracker.Entries<ExternalIdentity>()
+                .Where(entry => entry.State != EntityState.Deleted && entry.Entity.Id == targetIdentity.Id)
+                .Select(entry => entry.Entity)
+                .FirstOrDefault()
+                ?? await db.ExternalIdentities.FindAsync([targetIdentity.Id], ct)
                 ?? throw new InvalidOperationException("Deployment identity reconciliation lost its target row.");
             MergeIdentityMetadata(trackedTarget, sourceIdentity);
             await db.ExternalIdentities
@@ -872,10 +1013,27 @@ internal sealed class EntityResolver(TracebackDbContext db)
                 .ExecuteDeleteAsync(ct);
         }
 
-        await db.ExternalIdentities
-            .Where(identity => identity.DeploymentId == sourceId)
-            .ExecuteUpdateAsync(setters => setters.SetProperty(identity => identity.DeploymentId, targetId), ct);
+        if (IsPendingDeployment(targetId))
+        {
+            var remainingSource = await db.ExternalIdentities
+                .Where(identity => identity.DeploymentId == sourceId)
+                .ToListAsync(ct);
+            foreach (var identity in remainingSource)
+                identity.DeploymentId = targetId;
+        }
+        else
+        {
+            await db.ExternalIdentities
+                .Where(identity => identity.DeploymentId == sourceId)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(identity => identity.DeploymentId, targetId), ct);
+        }
     }
+
+    private bool IsPendingBuildArtifact(Guid id) => db.ChangeTracker.Entries<BuildArtifact>()
+        .Any(entry => entry.State == EntityState.Added && entry.Entity.Id == id);
+
+    private bool IsPendingDeployment(Guid id) => db.ChangeTracker.Entries<Deployment>()
+        .Any(entry => entry.State == EntityState.Added && entry.Entity.Id == id);
 
     private static (Guid ServiceId, Guid EnvironmentId, DateTimeOffset DeployedAt) DeploymentNaturalKey(Deployment deployment) =>
         (deployment.ServiceId, deployment.EnvironmentId, deployment.DeployedAt);
@@ -895,12 +1053,55 @@ internal sealed class EntityResolver(TracebackDbContext db)
     {
         if (target.WorkflowRunId is null)
             target.WorkflowRunId = source.WorkflowRunId;
-        if (target.Status == DeploymentStatus.Unknown)
+
+        // Status, watermark, and creator are one provider fact. Choose the
+        // newest timestamped fact; a known status beats Unknown, and terminal
+        // legacy state (which has no trustworthy watermark) is never regressed.
+        // Ties retain the already-selected target row, making the digest owner
+        // the deterministic winner without mixing fields from two providers.
+        if (CompareDeploymentState(source, target) > 0)
+        {
             target.Status = source.Status;
+            target.ProviderStateAt = source.ProviderStateAt;
+            target.CreatedByProvider = source.CreatedByProvider;
+        }
+
         target.IsPlaceholder &= source.IsPlaceholder;
         Touch(target, source.FirstObservedAt);
         Touch(target, source.LastObservedAt);
     }
+
+    private static int CompareDeploymentState(Deployment candidate, Deployment current)
+    {
+        if (current.ProviderStateAt is null && IsTerminal(current.Status))
+            return -1;
+
+        var candidateKnown = candidate.Status != DeploymentStatus.Unknown;
+        var currentKnown = current.Status != DeploymentStatus.Unknown;
+        if (candidateKnown != currentKnown)
+            return candidateKnown ? 1 : -1;
+
+        if (candidate.ProviderStateAt is { } candidateAt && current.ProviderStateAt is { } currentAt)
+            return candidateAt.CompareTo(currentAt);
+        if (candidate.ProviderStateAt is not null)
+            return 1;
+        if (current.ProviderStateAt is not null)
+            return -1;
+
+        // Without a source clock, retain terminal state over a nonterminal
+        // state; equal facts resolve to the retained target row.
+        return DeploymentStateRank(candidate.Status).CompareTo(DeploymentStateRank(current.Status));
+    }
+
+    private static int DeploymentStateRank(DeploymentStatus status) => status switch
+    {
+        DeploymentStatus.Succeeded or DeploymentStatus.Failed => 2,
+        DeploymentStatus.InProgress => 1,
+        _ => 0,
+    };
+
+    private static bool IsTerminal(DeploymentStatus status) =>
+        status is DeploymentStatus.Succeeded or DeploymentStatus.Failed;
 
     private async Task AttachIdentityAsync(
         ExternalIdentity? existingIdentity,
@@ -946,8 +1147,16 @@ internal sealed class EntityResolver(TracebackDbContext db)
         Action<ExternalIdentity, Guid> assign,
         CancellationToken ct)
     {
-        var exists = await db.ExternalIdentities.AnyAsync(
-            i => i.Provider == provider && i.EntityTypeName == entityType && i.ExternalKey == key, ct);
+        var exists = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Any(entry => entry.State != EntityState.Deleted
+                && entry.Entity.Provider == provider
+                && entry.Entity.EntityTypeName == entityType
+                && entry.Entity.ExternalKey == key);
+        if (!exists)
+        {
+            exists = await db.ExternalIdentities.AnyAsync(
+                i => i.Provider == provider && i.EntityTypeName == entityType && i.ExternalKey == key, ct);
+        }
         if (!exists)
             await AttachNewIdentityAsync(entityType, provider, key, entityId, observedAt, assign, ct);
     }
@@ -957,14 +1166,18 @@ internal sealed class EntityResolver(TracebackDbContext db)
         // A prior descriptor in this batch may have queued the same identity
         // without flushing it yet. Check tracked rows before querying the
         // database so cache-hit merges remain idempotent within the batch.
-        var exists = db.ExternalIdentities.Local.Any(
-            i => i.Provider == provider &&
-                 i.EntityTypeName == ExternalEntityTypes.BuildArtifact &&
-                 i.ExternalKey == aliasKey) ||
-            await db.ExternalIdentities.AnyAsync(
-                i => i.Provider == provider &&
-                     i.EntityTypeName == ExternalEntityTypes.BuildArtifact &&
-                     i.ExternalKey == aliasKey, ct);
+        var exists = db.ChangeTracker.Entries<ExternalIdentity>()
+            .Any(entry => entry.State != EntityState.Deleted
+                && entry.Entity.Provider == provider
+                && entry.Entity.EntityTypeName == ExternalEntityTypes.BuildArtifact
+                && entry.Entity.ExternalKey == aliasKey);
+        if (!exists)
+        {
+            exists = await db.ExternalIdentities.AnyAsync(
+                i => i.Provider == provider
+                    && i.EntityTypeName == ExternalEntityTypes.BuildArtifact
+                    && i.ExternalKey == aliasKey, ct);
+        }
         if (exists)
             return;
         var identity = new ExternalIdentity

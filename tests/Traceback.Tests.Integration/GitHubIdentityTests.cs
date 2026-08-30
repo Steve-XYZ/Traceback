@@ -301,6 +301,8 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
         var thirdObservedAt = firstObservedAt.AddHours(2);
         var deploymentAt = firstObservedAt.AddHours(3);
         var nonDuplicateDeploymentAt = deploymentAt.AddHours(1);
+        var lifecycleObservedAt = firstObservedAt.AddHours(4);
+        var foreignLifecycleObservedAt = firstObservedAt.AddHours(5);
 
         var firstRun = new WorkflowRunObserved(
             new EventProvenance("provider-a", "workflow_run", "provider-a/run-1", null, firstObservedAt, firstObservedAt),
@@ -329,7 +331,7 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
             "provider-a/run-1", null, null, null, null, null, null, null,
             [new ArtifactDescriptor("build-output", null, digest, null)]);
         var digestDeployment = new DeploymentObserved(
-            new EventProvenance("provider-a", "deployment", "provider-a/deployment-1-digest", null, secondObservedAt, secondObservedAt),
+            new EventProvenance("provider-b", "deployment", "provider-b/deployment-1-digest", null, secondObservedAt, secondObservedAt),
             "service", "production",
             new ArtifactDescriptor("build-output", null, digest, null),
             DeploymentOutcome.Succeeded, deploymentAt, null);
@@ -339,15 +341,19 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
 
         await using var app = await TracebackApp.StartAsync(postgres.Container, seedFixturesOnStartup: false);
 
-        Assert.Equal(3, (await app.IngestAsync([firstRun, secondRun, firstDeployment])).Applied);
-        Assert.Equal(1, (await app.IngestAsync([digestArtifact])).Applied);
-        Assert.Equal(1, (await app.IngestAsync([digestRun])).Applied);
-        Assert.Equal(1, (await app.IngestAsync([digestDeployment])).Applied);
-        Assert.Equal(1, (await app.IngestAsync([nonDuplicateDeployment])).Applied);
+        Assert.Equal(4, (await app.IngestAsync([firstRun, secondRun, firstDeployment, nonDuplicateDeployment])).Applied);
+        // The digest owner and its run/deployment references are Added in this
+        // batch before the alias+digest observation reconciles the persisted
+        // provider-key row. The nonduplicate deployment is already persisted
+        // on the source row, so this batch exercises both FK migration paths.
+        var result = await app.IngestAsync([
+            digestArtifact,
+            digestRun,
+            digestDeployment,
+            reconciledArtifact,
+        ]);
 
-        var result = await app.IngestAsync([reconciledArtifact]);
-
-        Assert.Equal(1, result.Applied);
+        Assert.Equal(4, result.Applied);
         Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
         Assert.Equal([digest], await GitHubSyncHarness.QueryAsync(app, "SELECT digest FROM build_artifacts"));
         Assert.Equal([digest], await GitHubSyncHarness.QueryAsync(app, "SELECT canonical_key FROM build_artifacts"));
@@ -361,7 +367,8 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
             "SELECT count(DISTINCT build_artifact_id) FROM workflow_run_artifacts"));
 
         // The deployment at deploymentAt existed on both rows and collapses to
-        // one natural-key row; the later deployment migrates without collision.
+        // one natural-key row; the persisted nonduplicate deployment migrates
+        // without collision.
         Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "deployments"));
         Assert.Equal(["1"], await GitHubSyncHarness.QueryAsync(
             app,
@@ -370,14 +377,60 @@ public sealed class GitHubIdentityTests(PostgresContainerFixture postgres)
         Assert.Equal(["3"], await GitHubSyncHarness.QueryAsync(
             app,
             "SELECT count(*) FROM external_identities WHERE entity_type_name = 'deployment'"));
+        Assert.Equal(["3"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(*) FROM observations WHERE entity_type_name = 'deployment'"));
+        Assert.Equal(["0"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(*) FROM observations " +
+            "WHERE entity_type_name = 'deployment' AND deployment_id IS NULL"));
+        Assert.Equal(["1"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(*) FROM observations o " +
+            "JOIN deployments d ON d.id = o.deployment_id " +
+            "WHERE o.external_key = 'provider-a/deployment-1'"));
         Assert.Equal(8, await GitHubSyncHarness.CountRowsAsync(app, "observations"));
+
+        // The digest-owner deployment (provider-b) won the newer state fact
+        // along with its owner and watermark. Its later lifecycle update
+        // applies; a contradictory update from provider-a is evidence only.
+        var retainedOwnerLifecycle = new DeploymentObserved(
+            new EventProvenance("provider-b", "deployment", "provider-b/deployment-1-lifecycle", null,
+                lifecycleObservedAt, lifecycleObservedAt),
+            "service", "production",
+            new ArtifactDescriptor("build-output", null, digest, null),
+            new DeploymentOutcome("failed"), deploymentAt, null);
+        var otherProviderLifecycle = new DeploymentObserved(
+            new EventProvenance("provider-a", "deployment", "provider-a/deployment-1-lifecycle", null,
+                foreignLifecycleObservedAt, foreignLifecycleObservedAt),
+            "service", "production",
+            new ArtifactDescriptor("build-output", null, digest, null),
+            new DeploymentOutcome("succeeded"), deploymentAt, null);
+
+        Assert.Equal(1, (await app.IngestAsync([retainedOwnerLifecycle])).Applied);
+        Assert.Equal(1, (await app.IngestAsync([otherProviderLifecycle])).Applied);
+        Assert.Equal(["3"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT d.status FROM deployments d " +
+            "JOIN services s ON s.id = d.service_id WHERE s.name = 'service'"));
+        Assert.Equal(["provider-b"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT d.created_by_provider FROM deployments d " +
+            "JOIN services s ON s.id = d.service_id WHERE s.name = 'service'"));
+        Assert.Equal(["1"], await GitHubSyncHarness.QueryAsync(
+            app,
+            "SELECT count(*) FROM deployments d " +
+            "JOIN services s ON s.id = d.service_id " +
+            "WHERE s.name = 'service' AND d.created_by_provider = 'provider-b' AND d.provider_state_at = $1",
+            lifecycleObservedAt));
+        Assert.Equal(10, await GitHubSyncHarness.CountRowsAsync(app, "observations"));
 
         var repeat = await app.IngestAsync([reconciledArtifact]);
         Assert.Equal(0, repeat.Applied);
         Assert.Equal(1, await GitHubSyncHarness.CountRowsAsync(app, "build_artifacts"));
         Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "workflow_run_artifacts"));
         Assert.Equal(2, await GitHubSyncHarness.CountRowsAsync(app, "deployments"));
-        Assert.Equal(8, await GitHubSyncHarness.CountRowsAsync(app, "observations"));
+        Assert.Equal(10, await GitHubSyncHarness.CountRowsAsync(app, "observations"));
     }
 
     [Fact]
